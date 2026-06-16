@@ -21,7 +21,15 @@ final class AnalysisPipeline {
                 let prepared = try await mediaProcessor.prepareURLVideo(rawURL, options: options, settings: settings) { message in
                     Task { @MainActor in
                         jobs.update(jobID) {
-                            $0.stage = message.localizedCaseInsensitiveContains("subtitle") ? .subtitleProbe : .download
+                            if message.localizedCaseInsensitiveContains("metadata") {
+                                $0.stage = .metadata
+                            } else if message.localizedCaseInsensitiveContains("subtitle") {
+                                $0.stage = .subtitleProbe
+                            } else if message.localizedCaseInsensitiveContains("audio") {
+                                $0.stage = .audioExtraction
+                            } else {
+                                $0.stage = .download
+                            }
                             $0.progressValue = max($0.progressValue, 0.1)
                             $0.progress = message
                         }

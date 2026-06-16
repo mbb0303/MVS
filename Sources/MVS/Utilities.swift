@@ -105,34 +105,7 @@ private final class LineBuffer: @unchecked Sendable {
 
 enum ShellRunner {
     static func run(_ executable: String, _ arguments: [String]) async throws -> ShellResult {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-
-            let stdout = Pipe()
-            let stderr = Pipe()
-            process.standardInput = Pipe()
-            process.standardOutput = stdout
-            process.standardError = stderr
-
-            process.terminationHandler = { process in
-                let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: ShellResult(stdout: out, stderr: err))
-                } else {
-                    let message = err.isEmpty ? out : err
-                    continuation.resume(throwing: MVSError.processFailed(message.trimmingCharacters(in: .whitespacesAndNewlines)))
-                }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
+        try await runWithEnvironment(executable, arguments, environment: [:]) { _ in }
     }
 
     static func runStreaming(
