@@ -58,6 +58,11 @@ final class JobStore: ObservableObject {
     func job(with id: AnalysisJob.ID) -> AnalysisJob? {
         jobs.first { $0.id == id }
     }
+
+    func remove(_ id: AnalysisJob.ID) {
+        jobs.removeAll { $0.id == id }
+        try? persistence?.delete(id)
+    }
 }
 
 private final class JobPersistence {
@@ -117,6 +122,19 @@ private final class JobPersistence {
         sqlite3_bind_text(statement, 1, job.id.uuidString, -1, sqliteTransient)
         sqlite3_bind_text(statement, 2, json, -1, sqliteTransient)
         sqlite3_bind_double(statement, 3, job.updatedAt.timeIntervalSince1970)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw databaseError()
+        }
+    }
+
+    func delete(_ id: AnalysisJob.ID) throws {
+        let sql = "DELETE FROM jobs WHERE id = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw databaseError()
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id.uuidString, -1, sqliteTransient)
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw databaseError()
         }

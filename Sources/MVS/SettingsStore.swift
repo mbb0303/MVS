@@ -75,6 +75,9 @@ final class SettingsStore: ObservableObject {
 
     private let defaults: UserDefaults
     private let keychain = KeychainService()
+    private var cachedAPIKeys: [AIProvider: String] = [:]
+    private var cachedTranscriptionAPIKeys: [TranscriptionProvider: String] = [:]
+    private var didLoadCredentialStore = false
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -125,7 +128,10 @@ final class SettingsStore: ObservableObject {
 
     func saveAPIKey(_ key: String, provider: AIProvider) {
         do {
-            try keychain.saveAPIKey(key.trimmingCharacters(in: .whitespacesAndNewlines), provider: provider)
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            try keychain.saveAPIKey(trimmed, provider: provider)
+            cachedAPIKeys[provider] = trimmed
+            try saveUnifiedCredentialStore()
             lastSettingsError = nil
             refreshAPIKeyState()
         } catch {
@@ -134,20 +140,34 @@ final class SettingsStore: ObservableObject {
     }
 
     func loadAPIKey(provider: AIProvider) throws -> String {
+        if let cached = cachedAPIKeys[provider], !cached.isEmpty {
+            return cached
+        }
+        try loadUnifiedCredentialStoreIfNeeded()
+        if let cached = cachedAPIKeys[provider], !cached.isEmpty {
+            return cached
+        }
         guard let key = try keychain.loadAPIKey(provider: provider), !key.isEmpty else {
             throw MVSError.missingAPIKey(provider.displayName)
         }
+        cachedAPIKeys[provider] = key
+        try? saveUnifiedCredentialStore()
         return key
     }
 
     func clearAPIKey(provider: AIProvider) {
         keychain.deleteAPIKey(provider: provider)
+        cachedAPIKeys[provider] = nil
+        try? saveUnifiedCredentialStore()
         refreshAPIKeyState()
     }
 
     func saveTranscriptionAPIKey(_ key: String, provider: TranscriptionProvider) {
         do {
-            try keychain.saveTranscriptionAPIKey(key.trimmingCharacters(in: .whitespacesAndNewlines), provider: provider)
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            try keychain.saveTranscriptionAPIKey(trimmed, provider: provider)
+            cachedTranscriptionAPIKeys[provider] = trimmed
+            try saveUnifiedCredentialStore()
             lastSettingsError = nil
             refreshAPIKeyState()
         } catch {
@@ -156,28 +176,59 @@ final class SettingsStore: ObservableObject {
     }
 
     func loadTranscriptionAPIKey(provider: TranscriptionProvider) throws -> String {
+        if let cached = cachedTranscriptionAPIKeys[provider], !cached.isEmpty {
+            return cached
+        }
+        try loadUnifiedCredentialStoreIfNeeded()
+        if let cached = cachedTranscriptionAPIKeys[provider], !cached.isEmpty {
+            return cached
+        }
         guard let key = try keychain.loadTranscriptionAPIKey(provider: provider), !key.isEmpty else {
             throw MVSError.missingAPIKey(provider.displayName)
         }
+        cachedTranscriptionAPIKeys[provider] = key
+        try? saveUnifiedCredentialStore()
         return key
     }
 
     func clearTranscriptionAPIKey(provider: TranscriptionProvider) {
         keychain.deleteTranscriptionAPIKey(provider: provider)
+        cachedTranscriptionAPIKeys[provider] = nil
+        try? saveUnifiedCredentialStore()
         refreshAPIKeyState()
     }
 
     func refreshAPIKeyState() {
-        do {
-            hasAPIKey = try keychain.loadAPIKey(provider: .openAI)?.isEmpty == false
-            hasDeepSeekAPIKey = try keychain.loadAPIKey(provider: .deepSeek)?.isEmpty == false
-            hasBailianASRAPIKey = try keychain.loadTranscriptionAPIKey(provider: .bailianASR)?.isEmpty == false
-        } catch {
-            hasAPIKey = false
-            hasDeepSeekAPIKey = false
-            hasBailianASRAPIKey = false
-            lastSettingsError = error.localizedDescription
+        hasAPIKey = keychain.hasCredentialStore() || keychain.hasAPIKey(provider: .openAI) || cachedAPIKeys[.openAI]?.isEmpty == false
+        hasDeepSeekAPIKey = keychain.hasCredentialStore() || keychain.hasAPIKey(provider: .deepSeek) || cachedAPIKeys[.deepSeek]?.isEmpty == false
+        hasBailianASRAPIKey = keychain.hasCredentialStore() || keychain.hasTranscriptionAPIKey(provider: .bailianASR) || cachedTranscriptionAPIKeys[.bailianASR]?.isEmpty == false
+    }
+
+    private func loadUnifiedCredentialStoreIfNeeded() throws {
+        guard !didLoadCredentialStore else { return }
+        didLoadCredentialStore = true
+        let values = try keychain.loadCredentialStore()
+        for provider in AIProvider.allCases {
+            if let value = values[keychain.credentialKey(for: provider)], !value.isEmpty {
+                cachedAPIKeys[provider] = value
+            }
         }
+        for provider in TranscriptionProvider.allCases {
+            if let value = values[keychain.credentialKey(for: provider)], !value.isEmpty {
+                cachedTranscriptionAPIKeys[provider] = value
+            }
+        }
+    }
+
+    private func saveUnifiedCredentialStore() throws {
+        var values: [String: String] = [:]
+        for (provider, key) in cachedAPIKeys where !key.isEmpty {
+            values[keychain.credentialKey(for: provider)] = key
+        }
+        for (provider, key) in cachedTranscriptionAPIKeys where !key.isEmpty {
+            values[keychain.credentialKey(for: provider)] = key
+        }
+        try keychain.saveCredentialStore(values)
     }
 
     func resetVideoRootToVaultDefault() {

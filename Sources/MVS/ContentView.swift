@@ -232,6 +232,7 @@ struct JobListView: View {
 
     private func retry(_ job: AnalysisJob) {
         if job.source == .url, let sourceURL = job.sourceURL {
+            jobs.remove(job.id)
             pipeline.analyzeURL(
                 sourceURL,
                 options: URLAnalysisOptions(
@@ -246,6 +247,7 @@ struct JobListView: View {
             return
         }
         if let videoURL = job.videoURL {
+            jobs.remove(job.id)
             pipeline.summarizeArchivedVideo(
                 videoURL,
                 source: job.source,
@@ -280,6 +282,7 @@ struct JobRow: View {
     @EnvironmentObject private var jobs: JobStore
     let job: AnalysisJob
     let retry: () -> Void
+    @State private var markdownDocument: MarkdownDocument?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -312,7 +315,8 @@ struct JobRow: View {
                     Button("Open Video") { NSWorkspace.shared.open(video) }
                 }
                 if let note = job.noteURL {
-                    Button("Open Note") { NSWorkspace.shared.open(note) }
+                    Button("Read Note") { markdownDocument = MarkdownDocument(url: note) }
+                    Button("Reveal Note") { revealInFinder(note) }
                 }
                 if job.status == .running || job.status == .queued {
                     Button("Cancel") { jobs.cancel(job.id) }
@@ -326,7 +330,12 @@ struct JobRow: View {
                 HStack {
                     ForEach(job.artifacts.filter { $0.kind != .video && $0.kind != .note }.prefix(4)) { artifact in
                         Button(artifact.kind.rawValue) {
-                            NSWorkspace.shared.open(URL(fileURLWithPath: artifact.path))
+                            let url = URL(fileURLWithPath: artifact.path)
+                            if url.pathExtension.lowercased() == "md" {
+                                markdownDocument = MarkdownDocument(url: url)
+                            } else {
+                                revealInFinder(url)
+                            }
                         }
                     }
                 }
@@ -334,6 +343,9 @@ struct JobRow: View {
             }
         }
         .padding(.vertical, 8)
+        .sheet(item: $markdownDocument) { document in
+            MarkdownReaderView(document: document)
+        }
     }
 
     private func statusColor(_ status: JobStatus) -> Color {
@@ -345,11 +357,16 @@ struct JobRow: View {
                 case .cancelled: .orange
                 }
     }
+
+    private func revealInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
 }
 
 struct FinishedJobsView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var settings: SettingsStore
+    @State private var markdownDocument: MarkdownDocument?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -384,7 +401,8 @@ struct FinishedJobsView: View {
                         Text(item.source.libraryDirectoryName)
                             .foregroundStyle(.secondary)
                         HStack {
-                            Button("Open Note") { NSWorkspace.shared.open(item.noteURL) }
+                            Button("Read Note") { markdownDocument = MarkdownDocument(url: item.noteURL) }
+                            Button("Reveal Note") { NSWorkspace.shared.activateFileViewerSelecting([item.noteURL]) }
                             if let video = item.videoURL {
                                 Button("Open Video") { NSWorkspace.shared.open(video) }
                             }
@@ -395,6 +413,9 @@ struct FinishedJobsView: View {
             }
         }
         .padding(24)
+        .sheet(item: $markdownDocument) { document in
+            MarkdownReaderView(document: document)
+        }
     }
 }
 
@@ -429,5 +450,62 @@ struct AppLibrarySummaryView: View {
         }
         .padding(12)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct MarkdownDocument: Identifiable {
+    let id: String
+    let url: URL
+    let title: String
+    let content: String
+
+    init(url: URL) {
+        self.id = url.standardizedFileURL.path
+        self.url = url
+        self.title = url.deletingPathExtension().lastPathComponent
+        self.content = (try? String(contentsOf: url, encoding: .utf8)) ?? "Could not read \(url.path)"
+    }
+}
+
+struct MarkdownReaderView: View {
+    let document: MarkdownDocument
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(document.title)
+                        .font(.headline)
+                    Text(document.url.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([document.url])
+                }
+                Button("Close") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+            .padding()
+            Divider()
+            ScrollView {
+                Text(renderedMarkdown)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(24)
+            }
+        }
+        .frame(minWidth: 760, minHeight: 640)
+    }
+
+    private var renderedMarkdown: AttributedString {
+        (try? AttributedString(markdown: document.content, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(document.content)
     }
 }

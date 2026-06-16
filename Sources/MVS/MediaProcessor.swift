@@ -144,7 +144,7 @@ final class MediaProcessor {
         effectiveMetadata.duration = effectiveMetadata.duration ?? duration
         return PreparedMedia(
             title: title,
-            mediaID: archived.deletingPathExtension().lastPathComponent,
+            mediaID: effectiveMetadata.mediaID,
             archivedVideoURL: archived,
             audioChunks: chunks,
             duration: duration,

@@ -82,7 +82,7 @@ final class LibraryStore: ObservableObject {
             guard fileManager.fileExists(atPath: directory.path) else { continue }
 
             let notes = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.creationDateKey])
-                .filter { $0.pathExtension.lowercased() == "md" }
+                .filter { isPrimaryNoteURL($0) }
             for note in notes {
             let content = (try? String(contentsOf: note, encoding: .utf8)) ?? ""
             let title = extractYAMLValue("title", from: content) ?? note.deletingPathExtension().lastPathComponent
@@ -103,8 +103,14 @@ final class LibraryStore: ObservableObject {
         }
         }
 
-        return items.sorted {
+        let sorted = items.sorted {
             ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast)
+        }
+        var seen = Set<String>()
+        return sorted.filter { item in
+            guard !seen.contains(item.mediaID) else { return false }
+            seen.insert(item.mediaID)
+            return true
         }
     }
 
@@ -165,6 +171,14 @@ final class LibraryStore: ObservableObject {
             return nil
         }
         return String(content[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isPrimaryNoteURL(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "md" else { return false }
+        let name = url.deletingPathExtension().lastPathComponent.lowercased()
+        return !name.hasSuffix(".transcript")
+            && !name.hasSuffix(".outline")
+            && !name.hasSuffix(".mindmap")
     }
 
     private func resolveVideoPath(from content: String, noteURL: URL) -> URL? {

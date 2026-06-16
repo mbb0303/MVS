@@ -18,9 +18,9 @@ final class ObsidianWriter {
         let sourceDirectory = settings.vaultURL.appendingPathComponent(source.libraryDirectoryName)
         try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
 
-        let mediaID = prepared.archivedVideoURL.deletingPathExtension().lastPathComponent
+        let mediaID = prepared.mediaID
         let noteName = "\(MVSPaths.sanitizeFilename(mediaID)).md"
-        let noteURL = uniqueURL(sourceDirectory.appendingPathComponent(noteName))
+        let noteURL = sourceDirectory.appendingPathComponent(noteName)
         let artifactBaseURL = sourceDirectory.appendingPathComponent(MVSPaths.sanitizeFilename(mediaID))
         let metadataURL = artifactBaseURL.appendingPathExtension("metadata.json")
         let transcriptSRTURL = artifactBaseURL.appendingPathExtension("transcript.srt")
