@@ -26,7 +26,9 @@ struct MVSApp: App {
         Settings {
             SettingsView()
                 .environmentObject(settings)
-                .frame(width: 640)
+                .environmentObject(jobStore)
+                .environmentObject(libraryStore)
+                .frame(width: 780, height: 620)
         }
     }
 }

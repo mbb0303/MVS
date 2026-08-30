@@ -10,6 +10,10 @@ final class JobStore: ObservableObject {
     private var persistence: JobPersistence?
     private var runningTasks: [AnalysisJob.ID: Task<Void, Never>] = [:]
 
+    var hasActiveJobs: Bool {
+        jobs.contains { $0.status == .queued || $0.status == .running }
+    }
+
     func configure(settings: SettingsStore) {
         do {
             let database = try JobPersistence(vaultURL: settings.vaultURL)
@@ -74,6 +78,12 @@ final class JobStore: ObservableObject {
         runningTasks[id] = nil
         jobs.removeAll { $0.id == id }
         try? persistence?.delete(id)
+    }
+
+    func clearHistory() {
+        guard !hasActiveJobs else { return }
+        jobs.removeAll()
+        try? persistence?.deleteAll()
     }
 }
 
@@ -150,6 +160,10 @@ private final class JobPersistence {
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw databaseError()
         }
+    }
+
+    func deleteAll() throws {
+        try execute("DELETE FROM jobs;")
     }
 
     private func execute(_ sql: String) throws {

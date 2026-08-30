@@ -16,6 +16,8 @@ The current target is Apple Silicon macOS.
 - Split long transcripts into chunks before summary generation.
 - Generate Markdown notes, metadata, SRT transcripts, transcript Markdown, summary JSON, outline, and mindmap files.
 - Persist job history in SQLite and show resumable/retryable jobs in the UI.
+- Separate New Task, Jobs, and Library workspaces with in-app note and artifact reading.
+- Search and filter jobs/library items, inspect per-stage progress, and erase generated history without clearing API keys.
 - Package as a macOS `.app` and `.dmg`.
 
 ## Default Storage

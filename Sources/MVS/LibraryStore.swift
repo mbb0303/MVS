@@ -28,6 +28,28 @@ final class LibraryStore: ObservableObject {
         }
     }
 
+    func eraseAllGeneratedData(settings: SettingsStore) throws {
+        let targets = [
+            settings.vaultURL.appendingPathComponent("URL", isDirectory: true),
+            settings.vaultURL.appendingPathComponent("Local", isDirectory: true),
+            settings.vaultURL.appendingPathComponent("Meeting", isDirectory: true),
+            settings.videoRootURL.appendingPathComponent("URL", isDirectory: true),
+            settings.videoRootURL.appendingPathComponent("Local", isDirectory: true),
+            settings.videoRootURL.appendingPathComponent("Meeting", isDirectory: true),
+        ]
+        var seen = Set<String>()
+        for target in targets {
+            let path = target.standardizedFileURL.path
+            guard seen.insert(path).inserted, fileManager.fileExists(atPath: path) else { continue }
+            var trashedURL: NSURL?
+            try fileManager.trashItem(at: target, resultingItemURL: &trashedURL)
+        }
+        try ensureLibraryDirectories(settings: settings)
+        finishedJobs = []
+        pendingVideos = []
+        lastScanError = nil
+    }
+
     private func ensureLibraryDirectories(settings: SettingsStore) throws {
         try fileManager.createDirectory(at: settings.vaultURL, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: settings.videoRootURL, withIntermediateDirectories: true)
