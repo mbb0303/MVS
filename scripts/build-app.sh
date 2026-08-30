@@ -20,8 +20,8 @@ elif security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"$LOCAL_S
 else
   SIGN_IDENTITY="-"
 fi
-APP_VERSION="${MVS_APP_VERSION:-0.3.2}"
-BUILD_NUMBER="${MVS_BUILD_NUMBER:-5}"
+APP_VERSION="${MVS_APP_VERSION:-0.3.3}"
+BUILD_NUMBER="${MVS_BUILD_NUMBER:-6}"
 
 if [[ ! -f "$ICON_SOURCE" ]]; then
   echo "Missing icon source: $ICON_SOURCE"
