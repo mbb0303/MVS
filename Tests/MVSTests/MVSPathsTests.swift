@@ -23,6 +23,7 @@ final class MVSPathsTests: XCTestCase {
         XCTAssertEqual(VideoSourceKind.local.libraryDirectoryName, "Local")
         XCTAssertEqual(VideoSourceKind.zoom.libraryDirectoryName, "Meeting")
         XCTAssertEqual(VideoSourceKind.tencentMeeting.libraryDirectoryName, "Meeting")
+        XCTAssertEqual(VideoSourceKind.screenRecording.libraryDirectoryName, "Meeting")
     }
 
     func testDefaultLibraryPathIsAppOwned() {
@@ -128,6 +129,7 @@ final class MVSPathsTests: XCTestCase {
         XCTAssertTrue(RecordingController.isMeetingBundleIdentifier("com.tencent.wemeet.helper", source: .tencentMeeting))
         XCTAssertTrue(RecordingController.isMeetingBundleIdentifier("us.zoom.xos", source: .zoom))
         XCTAssertFalse(RecordingController.isMeetingBundleIdentifier("com.apple.Safari", source: .tencentMeeting))
+        XCTAssertFalse(RecordingController.isMeetingBundleIdentifier("com.tencent.meeting", source: .screenRecording))
     }
 
 

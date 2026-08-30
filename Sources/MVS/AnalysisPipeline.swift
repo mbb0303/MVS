@@ -168,7 +168,9 @@ final class AnalysisPipeline {
                     settings: settings,
                     jobs: jobs,
                     library: library,
-                    diarize: source == .zoom || source == .tencentMeeting ? settings.enableDiarizationForMeetings : false,
+                    diarize: source == .zoom || source == .tencentMeeting || source == .screenRecording
+                        ? settings.enableDiarizationForMeetings
+                        : false,
                     sourceURL: nil,
                     keepLocalVideoInNote: true,
                     removeURLDownloadAfterNote: false

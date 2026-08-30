@@ -12,9 +12,18 @@ final class RecordingController: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var status = "Click Refresh to load recording targets"
     @Published private(set) var lastRecordingURL: URL?
-    @Published var meetingSource: VideoSourceKind = .zoom
+    @Published var meetingSource: VideoSourceKind = .zoom {
+        didSet {
+            if meetingSource != oldValue {
+                includeMicrophone = meetingSource != .screenRecording
+            }
+        }
+    }
+    @Published var includeMicrophone = true
     @Published private(set) var screenPermissionGranted = false
     @Published private(set) var screenPermissionNeedsRestart = false
+    @Published private(set) var microphonePermissionGranted = false
+    @Published private(set) var microphonePermissionDenied = false
 
     private var displayMap: [String: SCDisplay] = [:]
     private var windowMap: [String: SCWindow] = [:]
@@ -26,6 +35,9 @@ final class RecordingController: NSObject, ObservableObject {
 
     override init() {
         screenPermissionGranted = CGPreflightScreenCaptureAccess()
+        let microphoneStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        microphonePermissionGranted = microphoneStatus == .authorized
+        microphonePermissionDenied = microphoneStatus == .denied || microphoneStatus == .restricted
         super.init()
     }
 
@@ -62,6 +74,20 @@ final class RecordingController: NSObject, ObservableObject {
                     let title = window.title?.isEmpty == false ? " - \(window.title!)" : ""
                     return CaptureTarget(id: "window-\(window.windowID)", kind: .window, name: "\(app)\(title)")
                 }
+            if meetingSource == .screenRecording {
+                targets = displayTargets
+                let validDisplayIDs = Set(displayTargets.map(\.id))
+                if let selectedTargetID, validDisplayIDs.contains(selectedTargetID) {
+                    self.selectedTargetID = selectedTargetID
+                } else {
+                    selectedTargetID = displayTargets.first?.id
+                }
+                status = displayTargets.isEmpty
+                    ? "No displays found"
+                    : "Found \(displayTargets.count) display(s); system audio will be recorded"
+                return
+            }
+
             targets = displayTargets + windowTargets
             let validIDs = Set(targets.map(\.id))
             let preferredWindowID = eligibleWindows
@@ -91,6 +117,11 @@ final class RecordingController: NSObject, ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func openMicrophoneSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func startRecording(settings: SettingsStore) async {
         guard !isRecording else { return }
         guard #available(macOS 15.0, *) else {
@@ -99,12 +130,8 @@ final class RecordingController: NSObject, ObservableObject {
         }
         do {
             guard ensureScreenPermission() else { return }
-            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-                _ = await AVCaptureDevice.requestAccess(for: .audio)
-            }
-            guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
-                status = "Microphone permission is required for meeting recording."
-                return
+            if includeMicrophone {
+                guard await ensureMicrophonePermission() else { return }
             }
             if selectedTargetID == nil {
                 status = "Loading capture targets"
@@ -204,6 +231,21 @@ final class RecordingController: NSObject, ObservableObject {
         return false
     }
 
+    private func ensureMicrophonePermission() async -> Bool {
+        var authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        if authorization == .notDetermined {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
+            authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        }
+        microphonePermissionGranted = authorization == .authorized
+        microphonePermissionDenied = authorization == .denied || authorization == .restricted
+        guard microphonePermissionGranted else {
+            status = "Microphone permission is unavailable. Turn off Microphone to record system audio only, or open Privacy Settings."
+            return false
+        }
+        return true
+    }
+
     private func clearTargets() {
         targets = []
         displayMap = [:]
@@ -233,6 +275,8 @@ final class RecordingController: NSObject, ObservableObject {
             return normalized == "com.tencent.meeting" || normalized.contains("wemeet")
         case .zoom:
             return normalized == "us.zoom.xos" || normalized.hasPrefix("us.zoom")
+        case .screenRecording:
+            return false
         default:
             return false
         }
@@ -263,7 +307,7 @@ final class RecordingController: NSObject, ObservableObject {
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-        configuration.captureMicrophone = true
+        configuration.captureMicrophone = includeMicrophone
 
         if let display = displayMap[targetID] {
             configuration.width = display.width

@@ -108,6 +108,7 @@ final class LibraryStore: ObservableObject {
             for note in notes {
             let content = (try? String(contentsOf: note, encoding: .utf8)) ?? ""
             let title = extractYAMLValue("title", from: content) ?? note.deletingPathExtension().lastPathComponent
+            let storedSource = extractYAMLValue("source", from: content).flatMap(VideoSourceKind.init(rawValue:)) ?? source
             let videoURL = resolveVideoPath(from: content, noteURL: note)
             let mediaID = extractYAMLValue("media_id", from: content)
             let created = try? note.resourceValues(forKeys: [.creationDateKey]).creationDate
@@ -115,7 +116,7 @@ final class LibraryStore: ObservableObject {
                 FinishedJob(
                     id: note.standardizedFileURL.path,
                     title: title,
-                    source: source,
+                    source: storedSource,
                     noteURL: note,
                     videoURL: videoURL,
                     mediaID: mediaID ?? inferredMediaID(noteURL: note, title: title, videoURL: videoURL),
@@ -152,12 +153,16 @@ final class LibraryStore: ObservableObject {
             for video in videos {
                 let path = video.standardizedFileURL.path
                 let mediaID = mediaID(from: video)
+                let inferredSource: VideoSourceKind = directoryName == "Meeting"
+                    && video.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains("screen-recording")
+                    ? .screenRecording
+                    : source
                 guard !referencedVideos.contains(path), !referencedMediaIDs.contains(mediaID) else { continue }
                 items.append(
                     PendingVideoSummary(
                         id: path,
                         title: video.deletingPathExtension().lastPathComponent,
-                        source: source,
+                        source: inferredSource,
                         videoURL: video,
                         mediaID: mediaID
                     )

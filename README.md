@@ -10,6 +10,7 @@ The current target is Apple Silicon macOS.
 - Import local `.mp4`, `.mov`, `.mkv`, and `.webm` files.
 - Manually record Zoom, Tencent Meeting, or any selected screen/window with ScreenCaptureKit.
 - Capture system audio and microphone audio on macOS 15+.
+- Use direct Screen mode to record an entire display with computer playback audio; microphone capture is optional and disabled by default in this mode.
 - Prefer platform subtitles for URL videos, then fall back to ASR when subtitles are unavailable or incomplete.
 - Transcribe audio with Alibaba Bailian ASR or OpenAI transcription.
 - Summarize transcripts with DeepSeek, Alibaba Bailian Qwen, or OpenAI.
@@ -161,6 +162,8 @@ System Settings -> Privacy & Security -> Microphone
 Enable the app or the terminal host used to launch MVS.
 
 Screen recording permission is tied to the installed app's code signature. After replacing a local ad-hoc build, open Meeting capture, click Refresh once, enable the current `MVS.app` in Privacy & Security, then quit and reopen MVS. Repeated Refresh clicks in the same session do not repeatedly request permission. Tencent Meeting windows are matched by bundle identifier `com.tencent.meeting`, with displays available as fallback targets.
+
+Microphone permission is independent from system audio capture. Zoom and Tencent modes enable the microphone option by default, while Screen mode defaults to system audio only. If microphone access is unavailable, turn off the Microphone switch to continue recording the selected window/display and computer playback audio.
 
 ## Notes
 

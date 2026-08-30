@@ -178,7 +178,7 @@ struct LibraryView: View {
         case .all: sourceMatches = true
         case .url: sourceMatches = source == .url
         case .local: sourceMatches = source == .local
-        case .meeting: sourceMatches = source == .zoom || source == .tencentMeeting
+        case .meeting: sourceMatches = source == .zoom || source == .tencentMeeting || source == .screenRecording
         }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return sourceMatches && (query.isEmpty || title.localizedCaseInsensitiveContains(query))
@@ -376,5 +376,6 @@ private func sourceIcon(_ source: VideoSourceKind) -> String {
     case .url: "link"
     case .local: "film"
     case .zoom, .tencentMeeting: "person.2.wave.2"
+    case .screenRecording: "display"
     }
 }

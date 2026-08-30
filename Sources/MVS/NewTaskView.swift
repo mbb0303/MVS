@@ -151,11 +151,15 @@ struct NewTaskView: View {
         VStack(alignment: .leading, spacing: 18) {
             sectionLabel("MEETING CAPTURE", icon: "record.circle")
 
-            Picker("Meeting app", selection: $recorder.meetingSource) {
+            Picker("Capture mode", selection: $recorder.meetingSource) {
                 Text("Zoom").tag(VideoSourceKind.zoom)
                 Text("Tencent Meeting").tag(VideoSourceKind.tencentMeeting)
+                Text("Screen").tag(VideoSourceKind.screenRecording)
             }
             .pickerStyle(.segmented)
+            .onChange(of: recorder.meetingSource) {
+                Task { await recorder.refreshTargets() }
+            }
 
             HStack(spacing: 10) {
                 Picker("Capture target", selection: Binding(
@@ -176,6 +180,16 @@ struct NewTaskView: View {
                 }
                 .buttonStyle(MVSSecondaryButtonStyle())
                 .help("Refresh capture targets")
+            }
+
+            HStack(spacing: 10) {
+                Label("System audio", systemImage: "speaker.wave.2.fill")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(MVSTheme.success)
+                Toggle("Microphone", isOn: $recorder.includeMicrophone)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Spacer()
             }
 
             HStack(spacing: 10) {
@@ -225,6 +239,21 @@ struct NewTaskView: View {
                     Spacer()
                     Button("Open Privacy Settings") {
                         recorder.openScreenRecordingSettings()
+                    }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                }
+            }
+
+            if recorder.includeMicrophone && recorder.microphonePermissionDenied {
+                HStack(spacing: 8) {
+                    Image(systemName: "mic.slash")
+                        .foregroundStyle(MVSTheme.gold)
+                    Text("The current build does not have microphone access. You can turn Microphone off and still record system audio.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MVSTheme.muted)
+                    Spacer()
+                    Button("Open Microphone Settings") {
+                        recorder.openMicrophoneSettings()
                     }
                     .buttonStyle(MVSSecondaryButtonStyle())
                 }

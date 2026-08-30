@@ -5,6 +5,7 @@ enum VideoSourceKind: String, CaseIterable, Codable, Identifiable {
     case local = "Local"
     case zoom = "Zoom"
     case tencentMeeting = "TencentMeeting"
+    case screenRecording = "ScreenRecording"
 
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum VideoSourceKind: String, CaseIterable, Codable, Identifiable {
         case .local: "Local Video"
         case .zoom: "Zoom"
         case .tencentMeeting: "Tencent Meeting"
+        case .screenRecording: "Screen Recording"
         }
     }
 
@@ -22,6 +24,7 @@ enum VideoSourceKind: String, CaseIterable, Codable, Identifiable {
         case .url: "url-video"
         case .local: "local-video"
         case .zoom, .tencentMeeting: "meeting-recording"
+        case .screenRecording: "screen-recording"
         }
     }
 
@@ -29,7 +32,7 @@ enum VideoSourceKind: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .url: "URL"
         case .local: "Local"
-        case .zoom, .tencentMeeting: "Meeting"
+        case .zoom, .tencentMeeting, .screenRecording: "Meeting"
         }
     }
 }
