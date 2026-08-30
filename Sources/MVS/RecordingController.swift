@@ -1,4 +1,6 @@
 import AVFoundation
+import AppKit
+import CoreGraphics
 import Foundation
 @preconcurrency import ScreenCaptureKit
 import SwiftUI
@@ -11,6 +13,8 @@ final class RecordingController: NSObject, ObservableObject {
     @Published private(set) var status = "Click Refresh to load recording targets"
     @Published private(set) var lastRecordingURL: URL?
     @Published var meetingSource: VideoSourceKind = .zoom
+    @Published private(set) var screenPermissionGranted = false
+    @Published private(set) var screenPermissionNeedsRestart = false
 
     private var displayMap: [String: SCDisplay] = [:]
     private var windowMap: [String: SCWindow] = [:]
@@ -18,16 +22,32 @@ final class RecordingController: NSObject, ObservableObject {
     private var recordingOutput: SCRecordingOutput?
     private var recordingFinished = false
     private var finishContinuation: CheckedContinuation<Void, Never>?
+    private var requestedScreenPermissionThisSession = false
+
+    override init() {
+        screenPermissionGranted = CGPreflightScreenCaptureAccess()
+        super.init()
+    }
 
     func refreshTargets() async {
+        guard ensureScreenPermission() else {
+            clearTargets()
+            return
+        }
         do {
-            let content = try await SCShareableContent.current
+            status = "Loading capture targets"
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false,
+                onScreenWindowsOnly: false
+            )
             displayMap = Dictionary(uniqueKeysWithValues: content.displays.map { display in
                 let id = "display-\(display.displayID)"
                 return (id, display)
             })
-            windowMap = Dictionary(uniqueKeysWithValues: content.windows
-                .filter { $0.isOnScreen && ($0.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier) }
+            let eligibleWindows = content.windows
+                .filter { isEligibleWindow($0) }
+                .sorted { windowPriority($0) < windowPriority($1) }
+            windowMap = Dictionary(uniqueKeysWithValues: eligibleWindows
                 .map { window in
                     let id = "window-\(window.windowID)"
                     return (id, window)
@@ -36,20 +56,39 @@ final class RecordingController: NSObject, ObservableObject {
             let displayTargets = content.displays.map { display in
                 CaptureTarget(id: "display-\(display.displayID)", kind: .display, name: "Display \(display.displayID) \(display.width)x\(display.height)")
             }
-            let windowTargets = content.windows
-                .filter { $0.isOnScreen && ($0.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier) }
-                .sorted { ($0.owningApplication?.applicationName ?? "") < ($1.owningApplication?.applicationName ?? "") }
+            let windowTargets = eligibleWindows
                 .map { window in
                     let app = window.owningApplication?.applicationName ?? "Window"
                     let title = window.title?.isEmpty == false ? " - \(window.title!)" : ""
                     return CaptureTarget(id: "window-\(window.windowID)", kind: .window, name: "\(app)\(title)")
                 }
             targets = displayTargets + windowTargets
-            selectedTargetID = selectedTargetID ?? targets.first?.id
-            status = targets.isEmpty ? "No capture targets found" : "Targets refreshed"
+            let validIDs = Set(targets.map(\.id))
+            let preferredWindowID = eligibleWindows
+                .first(where: { isPreferredMeetingWindow($0) })
+                .map { "window-\($0.windowID)" }
+            if let preferredWindowID {
+                selectedTargetID = preferredWindowID
+            } else if let selectedTargetID, validIDs.contains(selectedTargetID) {
+                self.selectedTargetID = selectedTargetID
+            } else {
+                selectedTargetID = displayTargets.first?.id ?? windowTargets.first?.id
+            }
+            status = targets.isEmpty
+                ? "No capture targets found"
+                : "Found \(displayTargets.count) display(s) and \(windowTargets.count) window(s)"
         } catch {
-            status = error.localizedDescription
+            clearTargets()
+            screenPermissionGranted = CGPreflightScreenCaptureAccess()
+            status = screenPermissionGranted
+                ? "Could not load capture targets: \(error.localizedDescription)"
+                : "Screen recording permission is not active. Quit and reopen MVS after enabling it."
         }
+    }
+
+    func openScreenRecordingSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func startRecording(settings: SettingsStore) async {
@@ -59,8 +98,13 @@ final class RecordingController: NSObject, ObservableObject {
             return
         }
         do {
+            guard ensureScreenPermission() else { return }
             if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
                 _ = await AVCaptureDevice.requestAccess(for: .audio)
+            }
+            guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+                status = "Microphone permission is required for meeting recording."
+                return
             }
             if selectedTargetID == nil {
                 status = "Loading capture targets"
@@ -134,6 +178,71 @@ final class RecordingController: NSObject, ObservableObject {
         recordingFinished = true
         finishContinuation?.resume()
         finishContinuation = nil
+    }
+
+    private func ensureScreenPermission() -> Bool {
+        if CGPreflightScreenCaptureAccess() {
+            screenPermissionGranted = true
+            screenPermissionNeedsRestart = false
+            return true
+        }
+
+        screenPermissionGranted = false
+        if !requestedScreenPermissionThisSession {
+            requestedScreenPermissionThisSession = true
+            let granted = CGRequestScreenCaptureAccess()
+            screenPermissionGranted = CGPreflightScreenCaptureAccess()
+            screenPermissionNeedsRestart = granted && !screenPermissionGranted
+            if screenPermissionGranted {
+                return true
+            }
+        }
+
+        status = screenPermissionNeedsRestart
+            ? "Permission changed. Quit and reopen MVS once."
+            : "Screen recording permission is required. Open Privacy Settings, enable MVS, then quit and reopen it."
+        return false
+    }
+
+    private func clearTargets() {
+        targets = []
+        displayMap = [:]
+        windowMap = [:]
+        selectedTargetID = nil
+    }
+
+    private func isEligibleWindow(_ window: SCWindow) -> Bool {
+        guard let application = window.owningApplication,
+              application.bundleIdentifier != Bundle.main.bundleIdentifier,
+              window.frame.width >= 120,
+              window.frame.height >= 80 else {
+            return false
+        }
+        return window.isOnScreen || isPreferredMeetingWindow(window)
+    }
+
+    private func isPreferredMeetingWindow(_ window: SCWindow) -> Bool {
+        guard let bundleID = window.owningApplication?.bundleIdentifier.lowercased() else { return false }
+        return Self.isMeetingBundleIdentifier(bundleID, source: meetingSource)
+    }
+
+    nonisolated static func isMeetingBundleIdentifier(_ bundleID: String, source: VideoSourceKind) -> Bool {
+        let normalized = bundleID.lowercased()
+        switch source {
+        case .tencentMeeting:
+            return normalized == "com.tencent.meeting" || normalized.contains("wemeet")
+        case .zoom:
+            return normalized == "us.zoom.xos" || normalized.hasPrefix("us.zoom")
+        default:
+            return false
+        }
+    }
+
+    private func windowPriority(_ window: SCWindow) -> String {
+        let preferred = isPreferredMeetingWindow(window) ? "0" : (window.isOnScreen ? "1" : "2")
+        let app = window.owningApplication?.applicationName ?? ""
+        let title = window.title ?? ""
+        return "\(preferred)-\(app)-\(title)"
     }
 
     private func contentFilter(for targetID: String) throws -> SCContentFilter {

@@ -12,9 +12,16 @@ ICON_SOURCE="$ROOT_DIR/assets/AppIconSource-v2.png"
 ICONSET_DIR="$ROOT_DIR/.build/AppIcon.iconset"
 ICNS_PATH="$RESOURCES_DIR/AppIcon.icns"
 ENTITLEMENTS_PATH="$ROOT_DIR/config/MVS.entitlements"
-SIGN_IDENTITY="${MVS_SIGN_IDENTITY:--}"
-APP_VERSION="${MVS_APP_VERSION:-0.3.0}"
-BUILD_NUMBER="${MVS_BUILD_NUMBER:-3}"
+LOCAL_SIGN_IDENTITY="MVS Local Development"
+if [[ -n "${MVS_SIGN_IDENTITY:-}" ]]; then
+  SIGN_IDENTITY="$MVS_SIGN_IDENTITY"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"$LOCAL_SIGN_IDENTITY\""; then
+  SIGN_IDENTITY="$LOCAL_SIGN_IDENTITY"
+else
+  SIGN_IDENTITY="-"
+fi
+APP_VERSION="${MVS_APP_VERSION:-0.3.1}"
+BUILD_NUMBER="${MVS_BUILD_NUMBER:-4}"
 
 if [[ ! -f "$ICON_SOURCE" ]]; then
   echo "Missing icon source: $ICON_SOURCE"
@@ -90,7 +97,7 @@ sed -i '' "s/__APP_VERSION__/$APP_VERSION/g; s/__BUILD_NUMBER__/$BUILD_NUMBER/g"
 xattr -cr "$APP_DIR"
 
 SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
-if [[ "$SIGN_IDENTITY" != "-" ]]; then
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
   SIGN_ARGS+=(--options runtime --timestamp)
 else
   SIGN_ARGS+=(--options runtime)

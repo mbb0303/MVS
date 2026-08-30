@@ -209,6 +209,24 @@ struct NewTaskView: View {
                         Label("Start Recording", systemImage: "record.circle")
                     }
                     .buttonStyle(MVSPrimaryButtonStyle())
+                    .disabled(!recorder.screenPermissionGranted || recorder.selectedTargetID == nil)
+                }
+            }
+
+            if !recorder.screenPermissionGranted {
+                HStack(spacing: 8) {
+                    Image(systemName: recorder.screenPermissionNeedsRestart ? "arrow.clockwise.circle" : "lock.shield")
+                        .foregroundStyle(MVSTheme.gold)
+                    Text(recorder.screenPermissionNeedsRestart
+                        ? "Quit and reopen MVS once to activate the new permission."
+                        : "Screen recording permission is not active for this build.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MVSTheme.muted)
+                    Spacer()
+                    Button("Open Privacy Settings") {
+                        recorder.openScreenRecordingSettings()
+                    }
+                    .buttonStyle(MVSSecondaryButtonStyle())
                 }
             }
         }

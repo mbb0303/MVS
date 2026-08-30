@@ -123,6 +123,13 @@ final class MVSPathsTests: XCTestCase {
         XCTAssertEqual(artifact.id, "summaryJSON:/tmp/summary.json")
     }
 
+    func testMeetingBundleIdentifiersAreRecognized() {
+        XCTAssertTrue(RecordingController.isMeetingBundleIdentifier("com.tencent.meeting", source: .tencentMeeting))
+        XCTAssertTrue(RecordingController.isMeetingBundleIdentifier("com.tencent.wemeet.helper", source: .tencentMeeting))
+        XCTAssertTrue(RecordingController.isMeetingBundleIdentifier("us.zoom.xos", source: .zoom))
+        XCTAssertFalse(RecordingController.isMeetingBundleIdentifier("com.apple.Safari", source: .tencentMeeting))
+    }
+
 
     func testShellRunnerCancellationTerminatesProcess() async throws {
         let task = Task {

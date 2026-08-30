@@ -160,6 +160,8 @@ System Settings -> Privacy & Security -> Microphone
 
 Enable the app or the terminal host used to launch MVS.
 
+Screen recording permission is tied to the installed app's code signature. After replacing a local ad-hoc build, open Meeting capture, click Refresh once, enable the current `MVS.app` in Privacy & Security, then quit and reopen MVS. Repeated Refresh clicks in the same session do not repeatedly request permission. Tencent Meeting windows are matched by bundle identifier `com.tencent.meeting`, with displays available as fallback targets.
+
 ## Notes
 
 - Public URL support depends on `yt-dlp` and the target platform.
