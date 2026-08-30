@@ -147,4 +147,111 @@ final class MVSPathsTests: XCTestCase {
             // Expected.
         }
     }
+
+    @MainActor
+    func testLibraryProjectCanBeMovedIntoFolderAndRenamed() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mvs-library-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let vault = root.appendingPathComponent("Library", isDirectory: true)
+        let assets = vault.appendingPathComponent("assets", isDirectory: true)
+        let locations = TestLibraryLocations(vaultURL: vault, videoRootURL: assets)
+        let noteDirectory = vault.appendingPathComponent("Meeting", isDirectory: true)
+        let videoDirectory = assets.appendingPathComponent("Meeting", isDirectory: true)
+        try FileManager.default.createDirectory(at: noteDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: videoDirectory, withIntermediateDirectories: true)
+
+        let noteURL = noteDirectory.appendingPathComponent("demo.md")
+        let videoURL = videoDirectory.appendingPathComponent("demo.mp4")
+        try Data([0, 1, 2]).write(to: videoURL)
+        let videoPath = MVSPaths.relativePath(from: noteURL, to: videoURL)
+        let markdown = """
+        ---
+        source: TencentMeeting
+        title: "Original Title"
+        media_id: "demo-media"
+        video_path: "\(videoPath)"
+        ---
+
+        # Original Title
+
+        ## Summary
+        Test content.
+        """
+        try markdown.write(to: noteURL, atomically: true, encoding: .utf8)
+        try "# Transcript".write(
+            to: noteDirectory.appendingPathComponent("demo.transcript.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try JSONSerialization.data(
+            withJSONObject: ["title": "Original Title", "mediaID": "demo-media"],
+            options: [.prettyPrinted]
+        ).write(to: noteDirectory.appendingPathComponent("demo.metadata.json"))
+
+        let store = LibraryStore()
+        store.refresh(settings: locations)
+        let original = try XCTUnwrap(store.finishedJobs.first)
+        XCTAssertEqual(original.folderPath, "")
+
+        let folder = try store.createFolder(
+            named: "研究项目",
+            parentPath: nil,
+            sourceDirectoryName: "Meeting",
+            settings: locations
+        )
+        let mapping = try store.moveProject(original, toFolderPath: folder, settings: locations)
+        XCTAssertEqual(mapping.count, 3)
+
+        let moved = try XCTUnwrap(store.finishedJobs.first)
+        XCTAssertEqual(moved.folderPath, "研究项目")
+        XCTAssertEqual(moved.videoURL?.standardizedFileURL, videoURL.standardizedFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: moved.noteURL.path))
+
+        try store.renameProject(moved, to: "Renamed Project", settings: locations)
+        let renamed = try XCTUnwrap(store.finishedJobs.first)
+        XCTAssertEqual(renamed.title, "Renamed Project")
+        let updatedMarkdown = try String(contentsOf: renamed.noteURL, encoding: .utf8)
+        XCTAssertTrue(updatedMarkdown.contains("title: \"Renamed Project\""))
+        XCTAssertTrue(updatedMarkdown.contains("# Renamed Project"))
+    }
+
+    @MainActor
+    func testLibraryDeletionPreflightsEveryPathBeforeTrashing() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mvs-delete-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let vault = root.appendingPathComponent("Library", isDirectory: true)
+        let assets = vault.appendingPathComponent("assets", isDirectory: true)
+        let noteDirectory = vault.appendingPathComponent("Local", isDirectory: true)
+        try FileManager.default.createDirectory(at: noteDirectory, withIntermediateDirectories: true)
+        let noteURL = noteDirectory.appendingPathComponent("safe-project.md")
+        let outsideVideoURL = root.appendingPathComponent("outside.mp4")
+        try "# Safe Project".write(to: noteURL, atomically: true, encoding: .utf8)
+        try Data([0, 1, 2]).write(to: outsideVideoURL)
+
+        let item = FinishedJob(
+            id: noteURL.path,
+            title: "Safe Project",
+            source: .local,
+            noteURL: noteURL,
+            videoURL: outsideVideoURL,
+            mediaID: "safe-project",
+            createdAt: nil,
+            folderPath: ""
+        )
+        let store = LibraryStore()
+        let locations = TestLibraryLocations(vaultURL: vault, videoRootURL: assets)
+
+        XCTAssertThrowsError(try store.deleteProject(item, settings: locations))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: noteURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outsideVideoURL.path))
+    }
+}
+
+private struct TestLibraryLocations: LibraryLocationProviding {
+    let vaultURL: URL
+    let videoRootURL: URL
 }

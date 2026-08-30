@@ -35,7 +35,14 @@ struct LibraryView: View {
 
     @State private var selection: LibrarySelection?
     @State private var filter: LibraryFilter = .all
+    @State private var folderFilter = "__all__"
     @State private var searchText = ""
+    @State private var showNewFolder = false
+    @State private var renameItem: FinishedJob?
+    @State private var moveItem: FinishedJob?
+    @State private var deleteItem: FinishedJob?
+    @State private var deletePendingItem: PendingVideoSummary?
+    @State private var operationError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -49,7 +56,7 @@ struct LibraryView: View {
 
             HSplitView {
                 itemList
-                    .frame(minWidth: 310, idealWidth: 350, maxWidth: 430)
+                    .frame(minWidth: 320, idealWidth: 360, maxWidth: 450)
                     .frame(maxHeight: .infinity)
                     .background(MVSTheme.surface)
                 detail
@@ -67,21 +74,105 @@ struct LibraryView: View {
         .onChange(of: library.finishedJobs.map(\.id) + library.pendingVideos.map(\.id)) {
             selectFirstIfNeeded()
         }
+        .onChange(of: filter) {
+            folderFilter = "__all__"
+            selectFirstIfNeeded()
+        }
+        .sheet(isPresented: $showNewFolder) {
+            NewLibraryFolderSheet(
+                folders: library.folders,
+                initialSourceDirectory: defaultFolderSource
+            ) { name, parent, sourceDirectory in
+                createFolder(name: name, parent: parent, sourceDirectory: sourceDirectory)
+            }
+        }
+        .sheet(item: $renameItem) { item in
+            RenameProjectSheet(item: item) { title in
+                rename(item, to: title)
+            }
+        }
+        .sheet(item: $moveItem) { item in
+            MoveProjectSheet(item: item, folders: library.folderPaths(for: item.source)) { path in
+                move(item, to: path)
+            }
+        }
+        .confirmationDialog(
+            "Delete project?",
+            isPresented: Binding(
+                get: { deleteItem != nil },
+                set: { if !$0 { deleteItem = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: deleteItem
+        ) { item in
+            Button("Move Project and Media to Trash", role: .destructive) {
+                delete(item)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { item in
+            Text("“\(item.title)” and all generated artifacts will be moved to the Trash.")
+        }
+        .confirmationDialog(
+            "Delete video?",
+            isPresented: Binding(
+                get: { deletePendingItem != nil },
+                set: { if !$0 { deletePendingItem = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: deletePendingItem
+        ) { item in
+            Button("Move Video to Trash", role: .destructive) {
+                deletePending(item)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { item in
+            Text("“\(item.title)” will be removed from the MVS Library.")
+        }
+        .alert("Library Operation Failed", isPresented: Binding(
+            get: { operationError != nil },
+            set: { if !$0 { operationError = nil } }
+        )) {
+            Button("OK") { operationError = nil }
+        } message: {
+            Text(operationError ?? "Unknown error")
+        }
     }
 
     private var headerControls: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Picker("Source", selection: $filter) {
                 ForEach(LibraryFilter.allCases) { item in
                     Text(item.rawValue).tag(item)
                 }
             }
             .pickerStyle(.menu)
-            .frame(width: 105)
+            .frame(width: 100)
+
+            Picker("Folder", selection: $folderFilter) {
+                Text("All folders").tag("__all__")
+                Text("Unfiled").tag("__root__")
+                if !visibleFolders.isEmpty {
+                    Divider()
+                    ForEach(visibleFolders) { folder in
+                        Text("\(folder.sourceDirectoryName) / \(folder.path)")
+                            .tag(folder.id)
+                    }
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(width: 145)
 
             TextField("Search", text: $searchText)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 180)
+                .frame(width: 155)
+
+            Button {
+                showNewFolder = true
+            } label: {
+                Image(systemName: "folder.badge.plus")
+            }
+            .buttonStyle(MVSSecondaryButtonStyle())
+            .help("New folder")
 
             Button {
                 library.refresh(settings: settings)
@@ -107,12 +198,17 @@ struct LibraryView: View {
                             }
                         }
                     }
-                    if !filteredFinished.isEmpty {
-                        Section("Finished") {
-                            ForEach(filteredFinished) { item in
+                    ForEach(groupedFinished, id: \.folder) { group in
+                        Section {
+                            ForEach(group.items) { item in
                                 FinishedLibraryRow(item: item)
                                     .tag(LibrarySelection.finished(item.id))
                             }
+                        } header: {
+                            Label(
+                                group.folder.isEmpty ? "Unfiled" : group.folder,
+                                systemImage: group.folder.isEmpty ? "tray" : "folder"
+                            )
                         }
                     }
                 }
@@ -131,22 +227,31 @@ struct LibraryView: View {
         switch selection {
         case .finished(let id):
             if let item = library.finishedJobs.first(where: { $0.id == id }) {
-                LibraryDetailView(item: item)
+                LibraryDetailView(
+                    item: item,
+                    rename: { renameItem = item },
+                    move: { moveItem = item },
+                    delete: { deleteItem = item }
+                )
             } else {
                 emptyDetail
             }
         case .pending(let id):
             if let item = library.pendingVideos.first(where: { $0.id == id }) {
-                PendingLibraryDetail(item: item) {
-                    pipeline.summarizeArchivedVideo(
-                        item.videoURL,
-                        source: item.source,
-                        settings: settings,
-                        jobs: jobs,
-                        library: library
-                    )
-                    showJobs()
-                }
+                PendingLibraryDetail(
+                    item: item,
+                    summarize: {
+                        pipeline.summarizeArchivedVideo(
+                            item.videoURL,
+                            source: item.source,
+                            settings: settings,
+                            jobs: jobs,
+                            library: library
+                        )
+                        showJobs()
+                    },
+                    delete: { deletePendingItem = item }
+                )
             } else {
                 emptyDetail
             }
@@ -160,15 +265,50 @@ struct LibraryView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var filteredFinished: [FinishedJob] {
-        library.finishedJobs.filter { item in
-            matches(source: item.source, title: item.title)
+    private var visibleFolders: [LibraryFolder] {
+        library.folders.filter { folder in
+            switch filter {
+            case .all: true
+            case .url: folder.sourceDirectoryName == "URL"
+            case .local: folder.sourceDirectoryName == "Local"
+            case .meeting: folder.sourceDirectoryName == "Meeting"
+            }
         }
     }
 
+    private var filteredFinished: [FinishedJob] {
+        library.finishedJobs.filter { item in
+            guard matches(source: item.source, title: item.title) else { return false }
+            let key = "\(item.source.libraryDirectoryName)/\(item.folderPath)"
+            switch folderFilter {
+            case "__all__": return true
+            case "__root__": return item.folderPath.isEmpty
+            default: return key == folderFilter
+            }
+        }
+    }
+
+    private var groupedFinished: [(folder: String, items: [FinishedJob])] {
+        let groups = Dictionary(grouping: filteredFinished, by: \.folderPath)
+        return groups.keys.sorted { lhs, rhs in
+            if lhs.isEmpty { return true }
+            if rhs.isEmpty { return false }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+        .map { ($0, groups[$0] ?? []) }
+    }
+
     private var filteredPending: [PendingVideoSummary] {
-        library.pendingVideos.filter { item in
-            matches(source: item.source, title: item.title)
+        guard folderFilter == "__all__" || folderFilter == "__root__" else { return [] }
+        return library.pendingVideos.filter { matches(source: $0.source, title: $0.title) }
+    }
+
+    private var defaultFolderSource: String {
+        switch filter {
+        case .url: "URL"
+        case .local: "Local"
+        case .meeting: "Meeting"
+        case .all: "Meeting"
         }
     }
 
@@ -178,7 +318,8 @@ struct LibraryView: View {
         case .all: sourceMatches = true
         case .url: sourceMatches = source == .url
         case .local: sourceMatches = source == .local
-        case .meeting: sourceMatches = source == .zoom || source == .tencentMeeting || source == .screenRecording
+        case .meeting:
+            sourceMatches = source == .zoom || source == .tencentMeeting || source == .screenRecording
         }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return sourceMatches && (query.isEmpty || title.localizedCaseInsensitiveContains(query))
@@ -200,6 +341,67 @@ struct LibraryView: View {
             selection = nil
         }
     }
+
+    private func createFolder(name: String, parent: String?, sourceDirectory: String) {
+        do {
+            let path = try library.createFolder(
+                named: name,
+                parentPath: parent,
+                sourceDirectoryName: sourceDirectory,
+                settings: settings
+            )
+            folderFilter = "\(sourceDirectory)/\(path)"
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func rename(_ item: FinishedJob, to title: String) {
+        do {
+            try library.renameProject(item, to: title, settings: settings)
+            jobs.renameProjects(mediaID: item.mediaID, title: title)
+            selection = library.finishedJobs
+                .first(where: { $0.mediaID == item.mediaID })
+                .map { .finished($0.id) }
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func move(_ item: FinishedJob, to path: String?) {
+        do {
+            let mapping = try library.moveProject(item, toFolderPath: path, settings: settings)
+            jobs.relocateArtifacts(mapping, mediaID: item.mediaID)
+            selection = library.finishedJobs
+                .first(where: { $0.mediaID == item.mediaID })
+                .map { .finished($0.id) }
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func delete(_ item: FinishedJob) {
+        do {
+            try library.deleteProject(item, settings: settings)
+            jobs.removeProjects(mediaID: item.mediaID)
+            deleteItem = nil
+            selection = nil
+            selectFirstIfNeeded()
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func deletePending(_ item: PendingVideoSummary) {
+        do {
+            try library.deletePendingVideo(item, settings: settings)
+            deletePendingItem = nil
+            selection = nil
+            selectFirstIfNeeded()
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
 }
 
 private struct FinishedLibraryRow: View {
@@ -216,6 +418,10 @@ private struct FinishedLibraryRow: View {
                     .lineLimit(2)
                 HStack(spacing: 6) {
                     Text(item.source.libraryDirectoryName)
+                    if !item.folderPath.isEmpty {
+                        Text("·")
+                        Text(item.folderPath)
+                    }
                     if let created = item.createdAt {
                         Text("·")
                         Text(created.formatted(date: .abbreviated, time: .omitted))
@@ -223,6 +429,7 @@ private struct FinishedLibraryRow: View {
                 }
                 .font(.system(size: 10))
                 .foregroundStyle(MVSTheme.muted)
+                .lineLimit(1)
             }
             Spacer()
         }
@@ -252,36 +459,49 @@ private struct PendingLibraryRow: View {
 
 private struct LibraryDetailView: View {
     let item: FinishedJob
+    let rename: () -> Void
+    let move: () -> Void
+    let delete: () -> Void
     @State private var tab: LibraryArtifactTab = .note
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(item.source.libraryDirectoryName.uppercased())
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(MVSTheme.gold)
+                    HStack(spacing: 6) {
+                        Text(item.source.libraryDirectoryName.uppercased())
+                        if !item.folderPath.isEmpty {
+                            Text("/")
+                            Text(item.folderPath.uppercased())
+                        }
+                    }
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(MVSTheme.gold)
                     Text(item.title)
                         .font(.system(size: 21, weight: .semibold))
                         .foregroundStyle(MVSTheme.ink)
                         .textSelection(.enabled)
                 }
                 Spacer()
+                Button(action: rename) { Image(systemName: "pencil") }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                    .help("Rename project")
+                Button(action: move) { Image(systemName: "folder") }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                    .help("Move to folder")
                 if let video = item.videoURL {
                     Button {
                         NSWorkspace.shared.open(video)
                     } label: {
-                        Label("Open Video", systemImage: "play.rectangle")
+                        Image(systemName: "play.rectangle")
                     }
                     .buttonStyle(MVSSecondaryButtonStyle())
+                    .help("Open video")
                 }
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([item.noteURL])
-                } label: {
-                    Image(systemName: "folder")
-                }
-                .buttonStyle(MVSSecondaryButtonStyle())
-                .help("Reveal files")
+                Button(action: delete) { Image(systemName: "trash") }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                    .foregroundStyle(MVSTheme.danger)
+                    .help("Delete project")
             }
             .padding(22)
             .background(MVSTheme.canvas)
@@ -340,6 +560,7 @@ private struct LibraryDetailView: View {
 private struct PendingLibraryDetail: View {
     let item: PendingVideoSummary
     let summarize: () -> Void
+    let delete: () -> Void
 
     var body: some View {
         VStack(spacing: 18) {
@@ -363,11 +584,154 @@ private struct PendingLibraryDetail: View {
                     Label("Open Video", systemImage: "play.rectangle")
                 }
                 .buttonStyle(MVSSecondaryButtonStyle())
+                Button(action: delete) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(MVSSecondaryButtonStyle())
+                .foregroundStyle(MVSTheme.danger)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(30)
         .background(MVSTheme.canvas)
+    }
+}
+
+private struct RenameProjectSheet: View {
+    let item: FinishedJob
+    let save: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+
+    init(item: FinishedJob, save: @escaping (String) -> Void) {
+        self.item = item
+        self.save = save
+        _title = State(initialValue: item.title)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Rename Project").font(.system(size: 18, weight: .semibold))
+            TextField("Project title", text: $title)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(commit)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                Button("Rename", action: commit)
+                    .buttonStyle(MVSPrimaryButtonStyle())
+                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+        .background(MVSTheme.canvas)
+    }
+
+    private func commit() {
+        save(title)
+        dismiss()
+    }
+}
+
+private struct MoveProjectSheet: View {
+    let item: FinishedJob
+    let folders: [String]
+    let move: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var destination: String
+
+    init(item: FinishedJob, folders: [String], move: @escaping (String?) -> Void) {
+        self.item = item
+        self.folders = folders
+        self.move = move
+        _destination = State(initialValue: item.folderPath)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Move Project").font(.system(size: 18, weight: .semibold))
+            Picker("Folder", selection: $destination) {
+                Text("Unfiled").tag("")
+                ForEach(folders, id: \.self) { path in
+                    Text(path).tag(path)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                Button("Move") {
+                    move(destination.isEmpty ? nil : destination)
+                    dismiss()
+                }
+                .buttonStyle(MVSPrimaryButtonStyle())
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+        .background(MVSTheme.canvas)
+    }
+}
+
+private struct NewLibraryFolderSheet: View {
+    let folders: [LibraryFolder]
+    let create: (String, String?, String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var sourceDirectory: String
+    @State private var parentPath = ""
+
+    init(
+        folders: [LibraryFolder],
+        initialSourceDirectory: String,
+        create: @escaping (String, String?, String) -> Void
+    ) {
+        self.folders = folders
+        self.create = create
+        _sourceDirectory = State(initialValue: initialSourceDirectory)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("New Folder").font(.system(size: 18, weight: .semibold))
+            TextField("Folder name", text: $name)
+                .textFieldStyle(.roundedBorder)
+            Picker("Source", selection: $sourceDirectory) {
+                Text("URL").tag("URL")
+                Text("Local").tag("Local")
+                Text("Meeting").tag("Meeting")
+            }
+            .pickerStyle(.segmented)
+            Picker("Parent", selection: $parentPath) {
+                Text("Source root").tag("")
+                ForEach(parentFolders, id: \.path) { folder in
+                    Text(folder.path).tag(folder.path)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(MVSSecondaryButtonStyle())
+                Button("Create") {
+                    create(name, parentPath.isEmpty ? nil : parentPath, sourceDirectory)
+                    dismiss()
+                }
+                .buttonStyle(MVSPrimaryButtonStyle())
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 480)
+        .background(MVSTheme.canvas)
+        .onChange(of: sourceDirectory) {
+            parentPath = ""
+        }
+    }
+
+    private var parentFolders: [LibraryFolder] {
+        folders.filter { $0.sourceDirectoryName == sourceDirectory }
     }
 }
 

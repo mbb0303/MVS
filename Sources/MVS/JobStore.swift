@@ -85,6 +85,39 @@ final class JobStore: ObservableObject {
         jobs.removeAll()
         try? persistence?.deleteAll()
     }
+
+    func renameProjects(mediaID: String, title: String) {
+        for index in jobs.indices where jobs[index].mediaID == mediaID {
+            jobs[index].title = title
+            jobs[index].updatedAt = Date()
+            try? persistence?.save(jobs[index])
+        }
+    }
+
+    func relocateArtifacts(_ pathMapping: [String: String], mediaID: String) {
+        guard !pathMapping.isEmpty else { return }
+        for index in jobs.indices where jobs[index].mediaID == mediaID {
+            if let noteURL = jobs[index].noteURL,
+               let newPath = pathMapping[noteURL.standardizedFileURL.path] {
+                jobs[index].noteURL = URL(fileURLWithPath: newPath)
+            }
+            jobs[index].artifacts = jobs[index].artifacts.map { artifact in
+                guard let newPath = pathMapping[URL(fileURLWithPath: artifact.path).standardizedFileURL.path] else {
+                    return artifact
+                }
+                return JobArtifact(kind: artifact.kind, path: newPath)
+            }
+            jobs[index].updatedAt = Date()
+            try? persistence?.save(jobs[index])
+        }
+    }
+
+    func removeProjects(mediaID: String) {
+        let ids = jobs.filter { $0.mediaID == mediaID }.map(\.id)
+        for id in ids {
+            remove(id)
+        }
+    }
 }
 
 private final class JobPersistence {

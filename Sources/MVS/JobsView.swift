@@ -20,6 +20,7 @@ struct JobsView: View {
     @State private var selection: AnalysisJob.ID?
     @State private var filter: JobFilter = .all
     @State private var searchText = ""
+    @State private var operationError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,6 +56,14 @@ struct JobsView: View {
             } else if selection == nil {
                 selection = filteredJobs.first?.id
             }
+        }
+        .alert("Delete Failed", isPresented: Binding(
+            get: { operationError != nil },
+            set: { if !$0 { operationError = nil } }
+        )) {
+            Button("OK") { operationError = nil }
+        } message: {
+            Text(operationError ?? "Unknown error")
         }
     }
 
@@ -102,14 +111,27 @@ struct JobsView: View {
                 job: job,
                 cancel: { jobs.cancel(job.id) },
                 retry: { retry(job) },
-                remove: {
+                removeHistory: {
                     jobs.remove(job.id)
                     self.selection = filteredJobs.first?.id
+                },
+                deleteFiles: {
+                    deleteJobAndFiles(job)
                 }
             )
         } else {
             ContentUnavailableView("Select a job", systemImage: "list.bullet.rectangle")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func deleteJobAndFiles(_ job: AnalysisJob) {
+        do {
+            try library.deleteArtifacts(for: job, settings: settings)
+            jobs.remove(job.id)
+            selection = filteredJobs.first?.id
+        } catch {
+            operationError = error.localizedDescription
         }
     }
 
@@ -190,9 +212,11 @@ private struct JobDetailView: View {
     let job: AnalysisJob
     let cancel: () -> Void
     let retry: () -> Void
-    let remove: () -> Void
+    let removeHistory: () -> Void
+    let deleteFiles: () -> Void
 
     @State private var markdownDocument: MarkdownDocument?
+    @State private var confirmDelete = false
 
     var body: some View {
         ScrollView {
@@ -232,6 +256,23 @@ private struct JobDetailView: View {
         .background(MVSTheme.canvas)
         .sheet(item: $markdownDocument) { document in
             MarkdownReaderView(document: document)
+        }
+        .confirmationDialog(
+            "Delete job?",
+            isPresented: $confirmDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Remove Job from History") {
+                removeHistory()
+            }
+            if hasProjectFiles {
+                Button("Move Job and Project Files to Trash", role: .destructive) {
+                    deleteFiles()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Removing history keeps generated files. Deleting project files moves known notes, media, and artifacts to the Trash.")
         }
     }
 
@@ -318,7 +359,9 @@ private struct JobDetailView: View {
             }
             Spacer()
             if job.status == .failed || job.status == .cancelled || job.status == .completed {
-                Button(action: remove) {
+                Button {
+                    confirmDelete = true
+                } label: {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.plain)
@@ -326,6 +369,10 @@ private struct JobDetailView: View {
                 .help("Remove from job history")
             }
         }
+    }
+
+    private var hasProjectFiles: Bool {
+        job.noteURL != nil || job.videoURL != nil || !job.artifacts.isEmpty
     }
 
     @ViewBuilder

@@ -33,9 +33,17 @@ struct MarkdownContentView: View {
 
     private var renderedMarkdown: AttributedString {
         (try? AttributedString(
-            markdown: content,
+            markdown: contentWithoutFrontMatter,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        )) ?? AttributedString(content)
+        )) ?? AttributedString(contentWithoutFrontMatter)
+    }
+
+    private var contentWithoutFrontMatter: String {
+        guard content.hasPrefix("---\n"),
+              let closing = content.range(of: "\n---\n", range: content.index(content.startIndex, offsetBy: 4)..<content.endIndex) else {
+            return content
+        }
+        return String(content[closing.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

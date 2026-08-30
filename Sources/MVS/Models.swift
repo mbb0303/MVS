@@ -45,6 +45,15 @@ struct FinishedJob: Identifiable, Hashable {
     let videoURL: URL?
     let mediaID: String
     let createdAt: Date?
+    let folderPath: String
+}
+
+struct LibraryFolder: Identifiable, Hashable {
+    let sourceDirectoryName: String
+    let path: String
+
+    var id: String { "\(sourceDirectoryName)/\(path)" }
+    var name: String { URL(fileURLWithPath: path).lastPathComponent }
 }
 
 struct PendingVideoSummary: Identifiable, Hashable {

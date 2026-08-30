@@ -2,7 +2,13 @@ import Foundation
 import SwiftUI
 
 @MainActor
-final class SettingsStore: ObservableObject {
+protocol LibraryLocationProviding {
+    var vaultURL: URL { get }
+    var videoRootURL: URL { get }
+}
+
+@MainActor
+final class SettingsStore: ObservableObject, LibraryLocationProviding {
     @Published var vaultPath: String {
         didSet { defaults.set(vaultPath, forKey: Keys.vaultPath) }
     }

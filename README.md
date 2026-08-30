@@ -19,6 +19,8 @@ The current target is Apple Silicon macOS.
 - Persist job history in SQLite and show resumable/retryable jobs in the UI.
 - Separate New Task, Jobs, and Library workspaces with in-app note and artifact reading.
 - Search and filter jobs/library items, inspect per-stage progress, and erase generated history without clearing API keys.
+- Rename completed projects, organize note bundles into nested source folders, and move Library projects or pending videos to the Trash.
+- Delete job history independently, or delete a job together with its known project files.
 - Package as a macOS `.app` and `.dmg`.
 
 ## Default Storage
