@@ -143,9 +143,9 @@ def main():
     parser.add_argument("audio_files", nargs="+")
     args = parser.parse_args()
 
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    api_key = sys.stdin.readline().strip()
     if not api_key:
-        raise SystemExit("DASHSCOPE_API_KEY is not set")
+        raise SystemExit("Bailian API key was not provided on stdin")
 
     try:
         import dashscope

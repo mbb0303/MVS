@@ -77,6 +77,7 @@ enum JobStage: String, Codable, CaseIterable {
     case metadata
     case subtitleProbe
     case download
+    case audioDownload
     case archive
     case audioExtraction
     case transcription
@@ -93,6 +94,7 @@ enum JobStage: String, Codable, CaseIterable {
         case .metadata: "Reading metadata"
         case .subtitleProbe: "Checking platform subtitles"
         case .download: "Downloading video"
+        case .audioDownload: "Downloading audio"
         case .archive: "Archiving media"
         case .audioExtraction: "Extracting audio"
         case .transcription: "Transcribing"

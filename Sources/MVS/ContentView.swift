@@ -133,6 +133,8 @@ struct ContentView: View {
             JobListView()
         }
         .task {
+            MediaProcessor.cleanupStaleTemporaryDirectories()
+            MediaProcessor.cleanupLegacyIntermediateAudio(in: settings.videoRootURL)
             jobs.configure(settings: settings)
             preferURLSubtitles = settings.preferPlatformSubtitles
             forceURLASR = settings.forceASRForURL

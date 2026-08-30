@@ -36,7 +36,9 @@ final class ObsidianWriter {
         try renderOutline(summary: summary, title: title).write(to: outlineURL, atomically: true, encoding: .utf8)
         try renderMindmap(summary: summary, title: title).write(to: mindmapURL, atomically: true, encoding: .utf8)
 
-        let relativeVideo = includeLocalVideo ? MVSPaths.relativePath(from: noteURL, to: prepared.archivedVideoURL) : nil
+        let relativeVideo = includeLocalVideo
+            ? prepared.archivedVideoURL.map { MVSPaths.relativePath(from: noteURL, to: $0) }
+            : nil
         let markdown = renderMarkdown(
             source: source,
             title: title,
@@ -56,9 +58,8 @@ final class ObsidianWriter {
             transcriptModel: transcriptModel
         )
         try markdown.write(to: noteURL, atomically: true, encoding: .utf8)
-        let artifacts = [
+        var artifacts = [
             JobArtifact(kind: .note, path: noteURL.path),
-            JobArtifact(kind: .video, path: prepared.archivedVideoURL.path),
             JobArtifact(kind: .metadata, path: metadataURL.path),
             JobArtifact(kind: .transcriptSRT, path: transcriptSRTURL.path),
             JobArtifact(kind: .transcriptMarkdown, path: transcriptMarkdownURL.path),
@@ -66,6 +67,9 @@ final class ObsidianWriter {
             JobArtifact(kind: .outline, path: outlineURL.path),
             JobArtifact(kind: .mindmap, path: mindmapURL.path)
         ]
+        if let videoURL = prepared.archivedVideoURL {
+            artifacts.append(JobArtifact(kind: .video, path: videoURL.path))
+        }
         return NoteWriteResult(noteURL: noteURL, artifacts: artifacts)
     }
 

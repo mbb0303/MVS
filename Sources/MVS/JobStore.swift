@@ -8,6 +8,7 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 final class JobStore: ObservableObject {
     @Published private(set) var jobs: [AnalysisJob] = []
     private var persistence: JobPersistence?
+    private var runningTasks: [AnalysisJob.ID: Task<Void, Never>] = [:]
 
     func configure(settings: SettingsStore) {
         do {
@@ -46,6 +47,7 @@ final class JobStore: ObservableObject {
     }
 
     func cancel(_ id: AnalysisJob.ID) {
+        runningTasks[id]?.cancel()
         update(id) {
             guard $0.status == .queued || $0.status == .running else { return }
             $0.status = .cancelled
@@ -59,7 +61,17 @@ final class JobStore: ObservableObject {
         jobs.first { $0.id == id }
     }
 
+    func attach(_ task: Task<Void, Never>, to id: AnalysisJob.ID) {
+        runningTasks[id] = task
+    }
+
+    func detachTask(for id: AnalysisJob.ID) {
+        runningTasks[id] = nil
+    }
+
     func remove(_ id: AnalysisJob.ID) {
+        runningTasks[id]?.cancel()
+        runningTasks[id] = nil
         jobs.removeAll { $0.id == id }
         try? persistence?.delete(id)
     }

@@ -3,12 +3,13 @@ import Foundation
 struct PreparedMedia {
     let title: String
     let mediaID: String
-    let archivedVideoURL: URL
+    let archivedVideoURL: URL?
     let audioChunks: [URL]
     let duration: TimeInterval?
     let transcript: TranscriptResult?
     let transcriptModel: String?
     let metadata: MediaMetadataArtifact
+    let workingDirectoryURL: URL?
 }
 
 @MainActor
@@ -21,11 +22,15 @@ final class MediaProcessor {
         settings: SettingsStore,
         progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> PreparedMedia {
-        guard URL(string: rawURL) != nil else {
+        guard let sourceURL = URL(string: rawURL),
+              let scheme = sourceURL.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              sourceURL.host != nil else {
             throw MVSError.invalidURL(rawURL)
         }
         let ytDLP = try executable("yt-dlp")
         let tempDir = try makeTempDirectory(prefix: "mvs-url")
+        defer { try? fileManager.removeItem(at: tempDir) }
         let outputTemplate = tempDir.appendingPathComponent("%(title).200B-%(id)s.%(ext)s").path
 
         progress?("Reading video metadata")
@@ -37,6 +42,7 @@ final class MediaProcessor {
                 progress?("Checking platform subtitles")
                 _ = try await ShellRunner.runStreaming(ytDLP, ytdlpBaseArguments(settings: settings) + [
                     "--skip-download",
+                    "--ignore-errors",
                     "--write-subs",
                     "--write-auto-subs",
                     "--sub-langs", "zh-Hans,zh-CN,zh,zh-TW,zh-Hant,en.*",
@@ -57,39 +63,72 @@ final class MediaProcessor {
             }
         }
 
+        if let subtitleTranscript,
+           metadata.duration.map({ Self.transcriptCoversMedia(subtitleTranscript, duration: $0) }) ?? true {
+            let archivedVideo: URL?
+            if options.keepDownloadedVideo {
+                try await downloadVideo(rawURL, ytDLP: ytDLP, outputTemplate: outputTemplate, settings: settings, progress: progress)
+                let downloaded = try downloadedMedia(in: tempDir, extensions: ["mp4", "mov", "mkv", "webm"])
+                guard let videoURL = downloaded.first else {
+                    throw MVSError.processFailed("yt-dlp did not produce a video file.")
+                }
+                archivedVideo = try await archiveVideo(videoURL, source: .url, title: metadata.title, settings: settings, moveInsteadOfCopy: true)
+            } else {
+                archivedVideo = nil
+            }
+            return PreparedMedia(
+                title: metadata.title,
+                mediaID: metadata.mediaID,
+                archivedVideoURL: archivedVideo,
+                audioChunks: [],
+                duration: metadata.duration,
+                transcript: subtitleTranscript,
+                transcriptModel: "yt-dlp subtitles",
+                metadata: metadata,
+                workingDirectoryURL: nil
+            )
+        }
+
+        if options.keepDownloadedVideo {
+            try await downloadVideo(rawURL, ytDLP: ytDLP, outputTemplate: outputTemplate, settings: settings, progress: progress)
+            let downloaded = try downloadedMedia(in: tempDir, extensions: ["mp4", "mov", "mkv", "webm"])
+            guard let videoURL = downloaded.first else {
+                throw MVSError.processFailed("yt-dlp did not produce a video file.")
+            }
+            return try await prepareExistingVideo(
+                videoURL,
+                source: .url,
+                title: metadata.title,
+                settings: settings,
+                moveInsteadOfCopy: true,
+                progress: progress,
+                metadata: metadata
+            )
+        }
+
+        progress?("Downloading audio for transcription")
         do {
             _ = try await ShellRunner.runStreaming(ytDLP, ytdlpBaseArguments(settings: settings) + [
-            "--newline",
-            "--no-playlist",
-            "--merge-output-format", "mp4",
-            "-o", outputTemplate,
-            rawURL
+                "--format", "bestaudio/best",
+                "-o", outputTemplate,
+                rawURL
             ]) { line in
-            if let message = Self.downloadProgressMessage(from: line) {
-                progress?(message)
+                if let message = Self.downloadProgressMessage(from: line) {
+                    progress?(message.replacingOccurrences(of: "Downloading video", with: "Downloading audio"))
+                }
             }
-        }
         } catch {
             throw Self.humanizedYTDLPError(error, rawURL: rawURL)
         }
-
-        let downloaded = try fileManager.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: [.fileSizeKey], options: [])
-            .filter { ["mp4", "mov", "mkv", "webm"].contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        guard let videoURL = downloaded.first else {
-            throw MVSError.processFailed("yt-dlp did not produce a video file.")
+        let audioSources = try downloadedMedia(in: tempDir, extensions: ["m4a", "webm", "opus", "mp3", "aac", "wav", "ogg"])
+        guard let audioSource = audioSources.first else {
+            throw MVSError.processFailed("yt-dlp did not produce an audio file.")
         }
-        let title = metadata.title.isEmpty ? videoURL.deletingPathExtension().lastPathComponent : metadata.title
-        return try await prepareExistingVideo(
-            videoURL,
-            source: .url,
-            title: title,
-            settings: settings,
-            moveInsteadOfCopy: true,
-            progress: progress,
-            transcript: subtitleTranscript,
-            transcriptModel: subtitleTranscript == nil ? nil : "yt-dlp subtitles",
-            metadata: metadata
+        return try await prepareAudioOnly(
+            audioSource,
+            title: metadata.title,
+            metadata: metadata,
+            progress: progress
         )
     }
 
@@ -105,53 +144,89 @@ final class MediaProcessor {
         metadata: MediaMetadataArtifact? = nil
     ) async throws -> PreparedMedia {
         let archived: URL
-        if videoURL.standardizedFileURL.path.hasPrefix(settings.videoRootURL.standardizedFileURL.path) {
+        if MVSPaths.isURL(videoURL, inside: settings.videoRootURL) {
             archived = videoURL
         } else {
             progress?("Archiving video")
-            archived = try archiveVideo(videoURL, source: source, title: title, settings: settings, moveInsteadOfCopy: moveInsteadOfCopy)
+            archived = try await archiveVideo(videoURL, source: source, title: title, settings: settings, moveInsteadOfCopy: moveInsteadOfCopy)
         }
-        progress?("Extracting audio with ffmpeg")
-        let audio = try await extractCompressedAudio(from: archived)
-        progress?("Checking audio size")
-        let chunks = try await splitAudioIfNeeded(audio) { message in
-            progress?(message)
+        let workDirectory = try makeTempDirectory(prefix: "mvs-audio")
+        do {
+            progress?("Extracting audio with ffmpeg")
+            let audio = try await extractCompressedAudio(from: archived, outputDirectory: workDirectory)
+            progress?("Checking audio size")
+            let chunks = try await splitAudioIfNeeded(audio, outputDirectory: workDirectory) { message in
+                progress?(message)
+            }
+            let duration = try? await mediaDuration(for: archived)
+            let effectiveTranscript: TranscriptResult?
+            let effectiveTranscriptModel: String?
+            if let transcript, let duration, !Self.transcriptCoversMedia(transcript, duration: duration) {
+                progress?("Downloaded subtitles are incomplete; transcribing audio instead")
+                effectiveTranscript = nil
+                effectiveTranscriptModel = nil
+            } else {
+                effectiveTranscript = transcript
+                effectiveTranscriptModel = transcriptModel
+            }
+            var effectiveMetadata = metadata ?? MediaMetadataArtifact(
+                mediaID: archived.deletingPathExtension().lastPathComponent,
+                title: title,
+                sourceURL: nil,
+                platform: source.libraryDirectoryName,
+                uploader: nil,
+                duration: duration,
+                webpageURL: nil,
+                description: nil,
+                chapters: [],
+                createdAt: Date()
+            )
+            effectiveMetadata.duration = effectiveMetadata.duration ?? duration
+            return PreparedMedia(
+                title: title,
+                mediaID: effectiveMetadata.mediaID,
+                archivedVideoURL: archived,
+                audioChunks: chunks,
+                duration: duration,
+                transcript: effectiveTranscript,
+                transcriptModel: effectiveTranscriptModel,
+                metadata: effectiveMetadata,
+                workingDirectoryURL: workDirectory
+            )
+        } catch {
+            try? fileManager.removeItem(at: workDirectory)
+            throw error
         }
-        let duration = try? await mediaDuration(for: archived)
-        let effectiveTranscript: TranscriptResult?
-        let effectiveTranscriptModel: String?
-        if let transcript, let duration, !Self.transcriptCoversMedia(transcript, duration: duration) {
-            progress?("Downloaded subtitles are incomplete; transcribing audio instead")
-            effectiveTranscript = nil
-            effectiveTranscriptModel = nil
-        } else {
-            effectiveTranscript = transcript
-            effectiveTranscriptModel = transcriptModel
+    }
+
+    private func prepareAudioOnly(
+        _ sourceURL: URL,
+        title: String,
+        metadata: MediaMetadataArtifact,
+        progress: (@Sendable (String) -> Void)?
+    ) async throws -> PreparedMedia {
+        let workDirectory = try makeTempDirectory(prefix: "mvs-audio")
+        do {
+            progress?("Extracting audio with ffmpeg")
+            let audio = try await extractCompressedAudio(from: sourceURL, outputDirectory: workDirectory)
+            let chunks = try await splitAudioIfNeeded(audio, outputDirectory: workDirectory) { message in
+                progress?(message)
+            }
+            return PreparedMedia(
+                title: title,
+                mediaID: metadata.mediaID,
+                archivedVideoURL: nil,
+                audioChunks: chunks,
+                duration: metadata.duration,
+                transcript: nil,
+                transcriptModel: nil,
+                metadata: metadata,
+                workingDirectoryURL: workDirectory
+            )
+        } catch {
+            try? fileManager.removeItem(at: workDirectory)
+            throw error
         }
-        var effectiveMetadata = metadata ?? MediaMetadataArtifact(
-            mediaID: archived.deletingPathExtension().lastPathComponent,
-            title: title,
-            sourceURL: nil,
-            platform: source.libraryDirectoryName,
-            uploader: nil,
-            duration: duration,
-            webpageURL: nil,
-            description: nil,
-            chapters: [],
-            createdAt: Date()
-        )
-        effectiveMetadata.mediaID = archived.deletingPathExtension().lastPathComponent
-        effectiveMetadata.duration = effectiveMetadata.duration ?? duration
-        return PreparedMedia(
-            title: title,
-            mediaID: effectiveMetadata.mediaID,
-            archivedVideoURL: archived,
-            audioChunks: chunks,
-            duration: duration,
-            transcript: effectiveTranscript,
-            transcriptModel: effectiveTranscriptModel,
-            metadata: effectiveMetadata
-        )
     }
 
     func archiveRecordingURL(source: VideoSourceKind, title: String, settings: SettingsStore) throws -> URL {
@@ -162,30 +237,102 @@ final class MediaProcessor {
     }
 
     func removeGeneratedURLAssets(_ prepared: PreparedMedia) throws {
-        let candidates = Set(([prepared.archivedVideoURL, prepared.archivedVideoURL.deletingPathExtension().appendingPathExtension("wav")] + prepared.audioChunks).map(\.standardizedFileURL))
+        guard let archivedVideoURL = prepared.archivedVideoURL else { return }
+        let candidates = Set([archivedVideoURL.standardizedFileURL])
         for url in candidates where fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)
         }
+    }
 
-        let chunkDirectories = Set(prepared.audioChunks.map { $0.deletingLastPathComponent().standardizedFileURL })
-            .filter { $0.lastPathComponent.hasSuffix("-chunks") }
-        for directory in chunkDirectories where fileManager.fileExists(atPath: directory.path) {
-            try? fileManager.removeItem(at: directory)
+    func cleanupWorkingFiles(_ prepared: PreparedMedia) {
+        guard let directory = prepared.workingDirectoryURL,
+              fileManager.fileExists(atPath: directory.path) else { return }
+        try? fileManager.removeItem(at: directory)
+    }
+
+    static func cleanupStaleTemporaryDirectories(olderThan age: TimeInterval = 24 * 60 * 60) {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-age)
+        for child in children where child.lastPathComponent.hasPrefix("mvs-url-") || child.lastPathComponent.hasPrefix("mvs-audio-") {
+            let modified = try? child.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            if modified.map({ $0 < cutoff }) ?? false {
+                try? fileManager.removeItem(at: child)
+            }
         }
     }
 
-    private func archiveVideo(_ videoURL: URL, source: VideoSourceKind, title: String, settings: SettingsStore, moveInsteadOfCopy: Bool) throws -> URL {
+    static func cleanupLegacyIntermediateAudio(in assetRoot: URL) {
+        let fileManager = FileManager.default
+        for sourceDirectory in ["URL", "Local", "Meeting"] {
+            let directory = assetRoot.appendingPathComponent(sourceDirectory, isDirectory: true)
+            guard let children = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            let videoStems = Set(children
+                .filter { ["mp4", "mov", "mkv", "webm"].contains($0.pathExtension.lowercased()) }
+                .map { $0.deletingPathExtension().lastPathComponent })
+            for child in children {
+                let name = child.lastPathComponent
+                if child.pathExtension.lowercased() == "wav",
+                   videoStems.contains(child.deletingPathExtension().lastPathComponent) {
+                    try? fileManager.removeItem(at: child)
+                } else if name.hasSuffix("-chunks"),
+                          videoStems.contains(String(name.dropLast("-chunks".count))) {
+                    try? fileManager.removeItem(at: child)
+                }
+            }
+        }
+    }
+
+    private func archiveVideo(_ videoURL: URL, source: VideoSourceKind, title: String, settings: SettingsStore, moveInsteadOfCopy: Bool) async throws -> URL {
         let directory = assetDirectory(for: source, settings: settings)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let ext = videoURL.pathExtension.isEmpty ? "mp4" : videoURL.pathExtension
         let destination = uniqueURL(directory.appendingPathComponent("\(MVSPaths.timestamp())-\(MVSPaths.sanitizeFilename(title)).\(ext)"))
+        try Task.checkCancellation()
         if moveInsteadOfCopy {
             try fileManager.moveItem(at: videoURL, to: destination)
         } else {
-            try fileManager.copyItem(at: videoURL, to: destination)
+            do {
+                try await copyFileCancellable(from: videoURL, to: destination)
+            } catch {
+                try? fileManager.removeItem(at: destination)
+                throw error
+            }
         }
         return destination
+    }
+
+    private nonisolated func copyFileCancellable(from source: URL, to destination: URL) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                FileManager.default.createFile(atPath: destination.path, contents: nil)
+                let input = try FileHandle(forReadingFrom: source)
+                let output = try FileHandle(forWritingTo: destination)
+                defer {
+                    try? input.close()
+                    try? output.close()
+                }
+                while true {
+                    try Task.checkCancellation()
+                    guard let data = try input.read(upToCount: 4 * 1024 * 1024), !data.isEmpty else {
+                        break
+                    }
+                    try output.write(contentsOf: data)
+                }
+            }
+            try await group.next()
+            group.cancelAll()
+        }
     }
 
     private func assetDirectory(for source: VideoSourceKind, settings: SettingsStore) -> URL {
@@ -304,9 +451,9 @@ final class MediaProcessor {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func extractCompressedAudio(from videoURL: URL) async throws -> URL {
+    private func extractCompressedAudio(from videoURL: URL, outputDirectory: URL) async throws -> URL {
         let ffmpeg = try executable("ffmpeg")
-        let output = videoURL.deletingPathExtension().appendingPathExtension("wav")
+        let output = outputDirectory.appendingPathComponent("audio.wav")
         _ = try await ShellRunner.run(ffmpeg, [
             "-nostdin",
             "-y",
@@ -320,14 +467,18 @@ final class MediaProcessor {
         return output
     }
 
-    private func splitAudioIfNeeded(_ audioURL: URL, progress: (@Sendable (String) -> Void)? = nil) async throws -> [URL] {
+    private func splitAudioIfNeeded(
+        _ audioURL: URL,
+        outputDirectory: URL,
+        progress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> [URL] {
         let size = try audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         if size < 24_000_000 {
             return [audioURL]
         }
 
         let ffmpeg = try executable("ffmpeg")
-        let directory = audioURL.deletingLastPathComponent().appendingPathComponent(audioURL.deletingPathExtension().lastPathComponent + "-chunks")
+        let directory = outputDirectory.appendingPathComponent("chunks", isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         let template = directory.appendingPathComponent("chunk-%03d.wav").path
         progress?("Splitting long audio for transcription")
@@ -350,10 +501,7 @@ final class MediaProcessor {
     }
 
     private func mediaDuration(for url: URL) async throws -> TimeInterval? {
-        let ffprobeCandidates = ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"]
-        guard let ffprobe = ffprobeCandidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) else {
-            return nil
-        }
+        let ffprobe = try executable("ffprobe")
         let result = try await ShellRunner.run(ffprobe, [
             "-v", "error",
             "-show_entries", "format=duration",
@@ -436,13 +584,20 @@ final class MediaProcessor {
     private func ytdlpBaseArguments(settings: SettingsStore) -> [String] {
         var args = [
             "--newline",
+            "--ignore-config",
+            "--no-update",
+            "--no-remote-components",
+            "--restrict-filenames",
             "--no-playlist",
             "--retries", "3",
             "--fragment-retries", "3",
             "--extractor-retries", "3",
-            "--socket-timeout", "20",
-            "--remote-components", "ejs:github"
+            "--socket-timeout", "20"
         ]
+        if let deno = ["/opt/homebrew/bin/deno", "/usr/local/bin/deno"]
+            .first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            args += ["--js-runtimes", "deno:\(deno)"]
+        }
         let cookiesFile = settings.youtubeCookiesFile.trimmingCharacters(in: .whitespacesAndNewlines)
         let cookiesBrowser = settings.youtubeCookiesBrowser.trimmingCharacters(in: .whitespacesAndNewlines)
         if !cookiesFile.isEmpty {
@@ -459,6 +614,39 @@ final class MediaProcessor {
             }
         }
         return args
+    }
+
+    private func downloadVideo(
+        _ rawURL: String,
+        ytDLP: String,
+        outputTemplate: String,
+        settings: SettingsStore,
+        progress: (@Sendable (String) -> Void)?
+    ) async throws {
+        do {
+            _ = try await ShellRunner.runStreaming(ytDLP, ytdlpBaseArguments(settings: settings) + [
+                "--format", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                "--merge-output-format", "mp4",
+                "-o", outputTemplate,
+                rawURL
+            ]) { line in
+                if let message = Self.downloadProgressMessage(from: line) {
+                    progress?(message)
+                }
+            }
+        } catch {
+            throw Self.humanizedYTDLPError(error, rawURL: rawURL)
+        }
+    }
+
+    private func downloadedMedia(in directory: URL, extensions: Set<String>) throws -> [URL] {
+        try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+        .filter { extensions.contains($0.pathExtension.lowercased()) }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     private func readURLMetadata(_ rawURL: String, ytDLP: String, settings: SettingsStore) async throws -> MediaMetadataArtifact {

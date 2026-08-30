@@ -64,6 +64,7 @@ The library path can be changed in Settings.
 - Homebrew
 - Python 3
 - `ffmpeg`
+- Deno (used by the bundled `yt-dlp-ejs` YouTube challenge solver)
 - `yt-dlp`
 
 Install media/runtime dependencies:
@@ -72,7 +73,7 @@ Install media/runtime dependencies:
 scripts/setup-dependencies.sh
 ```
 
-This installs `ffmpeg` with Homebrew and project-local Python packages under `.tools/`. The `.tools/` directory is intentionally ignored by git.
+This installs `ffmpeg` and Deno with Homebrew, then creates a clean project-local runtime under `.tools/`. Security-sensitive dependencies are constrained to patched versions, and yt-dlp remote component downloads are disabled at runtime.
 
 ## Run From Source
 
@@ -97,6 +98,8 @@ scripts/build-app.sh
 open dist/MVS.app
 ```
 
+The real signed bundle is built outside iCloud under `~/Library/Caches/MVS/Build/MVS.app`; `dist/MVS.app` is a convenience link. This prevents iCloud File Provider metadata from invalidating the code signature.
+
 Build a DMG installer:
 
 ```bash
@@ -107,8 +110,18 @@ open dist/MVS.dmg
 Install the latest local build to `/Applications`:
 
 ```bash
-rsync -a --delete dist/MVS.app/ /Applications/MVS.app/
+scripts/install-app.sh
 ```
+
+Local builds receive a sealed ad-hoc signature with Hardened Runtime. For a distributable Developer ID build, first install a `Developer ID Application` certificate and store notary credentials once:
+
+```bash
+xcrun notarytool store-credentials MVS_NOTARY
+export MVS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+scripts/notarize-release.sh
+```
+
+The release script signs all nested native modules, signs the app and DMG with a secure timestamp, submits through `notarytool`, staples the ticket, and runs Gatekeeper validation.
 
 ## API Configuration
 
@@ -150,4 +163,6 @@ Enable the app or the terminal host used to launch MVS.
 - Public URL support depends on `yt-dlp` and the target platform.
 - Logged-in, paid, private, DRM-protected, or heavily rate-limited links may require cookies or may not work.
 - URL videos default to not keeping downloaded video after the note is generated, unless `Keep downloaded video` is enabled.
+- When complete platform subtitles are available and video retention is disabled, MVS skips video and audio download entirely. Otherwise it downloads audio-only for ASR unless the user explicitly keeps the video.
+- Cancel terminates active yt-dlp, ffmpeg, Python, and network work. Task audio is stored in a temporary workspace and removed on success, failure, or cancellation.
 - Meeting recording is manual: choose a capture target, start recording, stop recording, then MVS processes the saved video.

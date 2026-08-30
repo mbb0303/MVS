@@ -9,7 +9,8 @@ final class AnalysisPipeline {
         var job = AnalysisJob(source: .url, title: "URL Video")
         job.sourceURL = rawURL
         jobs.add(job)
-        Task {
+        let task = Task {
+            defer { jobs.detachTask(for: job.id) }
             do {
                 jobs.update(job.id) {
                     $0.status = .running
@@ -25,6 +26,8 @@ final class AnalysisPipeline {
                                 $0.stage = .metadata
                             } else if message.localizedCaseInsensitiveContains("subtitle") {
                                 $0.stage = .subtitleProbe
+                            } else if message.localizedCaseInsensitiveContains("downloading audio") {
+                                $0.stage = .audioDownload
                             } else if message.localizedCaseInsensitiveContains("audio") {
                                 $0.stage = .audioExtraction
                             } else {
@@ -50,17 +53,19 @@ final class AnalysisPipeline {
                     removeURLDownloadAfterNote: !options.keepDownloadedVideo
                 )
             } catch {
-                fail(job.id, error: error, jobs: jobs)
+                Task.isCancelled ? cancelled(job.id, jobs: jobs) : fail(job.id, error: error, jobs: jobs)
                 library?.refresh(settings: settings)
             }
         }
+        jobs.attach(task, to: job.id)
     }
 
     func analyzeLocalFile(_ fileURL: URL, settings: SettingsStore, jobs: JobStore, library: LibraryStore? = nil) {
         let title = fileURL.deletingPathExtension().lastPathComponent
         let job = AnalysisJob(source: .local, title: title)
         jobs.add(job)
-        Task {
+        let task = Task {
+            defer { jobs.detachTask(for: job.id) }
             do {
                 jobs.update(job.id) {
                     $0.status = .running
@@ -80,17 +85,19 @@ final class AnalysisPipeline {
                 }
                 try await finishAnalysis(jobID: job.id, source: .local, title: title, prepared: prepared, settings: settings, jobs: jobs, library: library, diarize: false)
             } catch {
-                fail(job.id, error: error, jobs: jobs)
+                Task.isCancelled ? cancelled(job.id, jobs: jobs) : fail(job.id, error: error, jobs: jobs)
                 library?.refresh(settings: settings)
             }
         }
+        jobs.attach(task, to: job.id)
     }
 
     func analyzeRecording(_ fileURL: URL, source: VideoSourceKind, settings: SettingsStore, jobs: JobStore, library: LibraryStore? = nil) {
         let title = fileURL.deletingPathExtension().lastPathComponent
         let job = AnalysisJob(source: source, title: title)
         jobs.add(job)
-        Task {
+        let task = Task {
+            defer { jobs.detachTask(for: job.id) }
             do {
                 jobs.update(job.id) {
                     $0.status = .running
@@ -122,17 +129,19 @@ final class AnalysisPipeline {
                     removeURLDownloadAfterNote: false
                 )
             } catch {
-                fail(job.id, error: error, jobs: jobs)
+                Task.isCancelled ? cancelled(job.id, jobs: jobs) : fail(job.id, error: error, jobs: jobs)
                 library?.refresh(settings: settings)
             }
         }
+        jobs.attach(task, to: job.id)
     }
 
     func summarizeArchivedVideo(_ fileURL: URL, source: VideoSourceKind, settings: SettingsStore, jobs: JobStore, library: LibraryStore? = nil) {
         let title = fileURL.deletingPathExtension().lastPathComponent
         let job = AnalysisJob(source: source, title: title)
         jobs.add(job)
-        Task {
+        let task = Task {
+            defer { jobs.detachTask(for: job.id) }
             do {
                 jobs.update(job.id) {
                     $0.status = .running
@@ -165,10 +174,11 @@ final class AnalysisPipeline {
                     removeURLDownloadAfterNote: false
                 )
             } catch {
-                fail(job.id, error: error, jobs: jobs)
+                Task.isCancelled ? cancelled(job.id, jobs: jobs) : fail(job.id, error: error, jobs: jobs)
                 library?.refresh(settings: settings)
             }
         }
+        jobs.attach(task, to: job.id)
     }
 
     private func finishAnalysis(
@@ -184,6 +194,8 @@ final class AnalysisPipeline {
         keepLocalVideoInNote: Bool = true,
         removeURLDownloadAfterNote: Bool = false
     ) async throws {
+        defer { mediaProcessor.cleanupWorkingFiles(prepared) }
+        try Task.checkCancellation()
         jobs.update(jobID) {
             $0.title = title
             $0.videoURL = prepared.archivedVideoURL
@@ -222,6 +234,7 @@ final class AnalysisPipeline {
         }
         let transcript = rawTranscript.convertedTraditionalChineseToSimplified()
 
+        try Task.checkCancellation()
         jobs.update(jobID) {
             $0.stage = .summarization
             $0.progressValue = 0.7
@@ -231,6 +244,7 @@ final class AnalysisPipeline {
         let summaryClient = SummaryClient(apiKey: summaryKey)
         let summary = try await summaryClient.summarize(transcript: transcript, title: title, source: source, settings: settings)
 
+        try Task.checkCancellation()
         jobs.update(jobID) {
             $0.stage = .writing
             $0.progressValue = 0.88
@@ -257,6 +271,7 @@ final class AnalysisPipeline {
             try mediaProcessor.removeGeneratedURLAssets(prepared)
         }
 
+        try Task.checkCancellation()
         jobs.update(jobID) {
             $0.status = .completed
             $0.stage = .completed
@@ -278,6 +293,17 @@ final class AnalysisPipeline {
             $0.progressValue = 1.0
             $0.progress = "Failed"
             $0.errorMessage = error.localizedDescription
+            $0.canRetry = true
+        }
+    }
+
+    private func cancelled(_ id: AnalysisJob.ID, jobs: JobStore) {
+        jobs.update(id) {
+            $0.status = .cancelled
+            $0.stage = .failed
+            $0.progressValue = 1.0
+            $0.progress = "Cancelled"
+            $0.errorMessage = nil
             $0.canRetry = true
         }
     }

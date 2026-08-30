@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum MVSPaths {
     static let legacyObsidianVaultPath = "/Users/mbb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Application/MVS"
@@ -63,6 +64,13 @@ enum MVSPaths {
         let down = Array(targetComponents[index...])
         return (up + down).joined(separator: "/")
     }
+
+    static func isURL(_ candidate: URL, inside directory: URL) -> Bool {
+        let child = candidate.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let parent = directory.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        guard child.count >= parent.count else { return false }
+        return child.prefix(parent.count).elementsEqual(parent)
+    }
 }
 
 struct ShellResult {
@@ -103,6 +111,53 @@ private final class LineBuffer: @unchecked Sendable {
     }
 }
 
+private final class RunningProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    func attach(_ process: Process) {
+        lock.lock()
+        self.process = process
+        let shouldCancel = cancelled
+        lock.unlock()
+        if shouldCancel {
+            terminate(process)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let process = process
+        lock.unlock()
+        if let process {
+            terminate(process)
+        }
+    }
+
+    func wasCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    private func terminate(_ process: Process) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        if pid > 0 {
+            kill(-pid, SIGTERM)
+            kill(pid, SIGTERM)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if kill(pid, 0) == 0 {
+                    kill(-pid, SIGKILL)
+                    kill(pid, SIGKILL)
+                }
+            }
+        }
+    }
+}
+
 enum ShellRunner {
     static func run(_ executable: String, _ arguments: [String]) async throws -> ShellResult {
         try await runWithEnvironment(executable, arguments, environment: [:]) { _ in }
@@ -120,9 +175,13 @@ enum ShellRunner {
         _ executable: String,
         _ arguments: [String],
         environment: [String: String],
+        standardInput: Data? = nil,
         onOutputLine: @escaping @Sendable (String) -> Void
     ) async throws -> ShellResult {
-        try await withCheckedThrowingContinuation { continuation in
+        let runningProcess = RunningProcess()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
@@ -155,13 +214,18 @@ enum ShellRunner {
 
             process.standardOutput = stdout
             process.standardError = stderr
-            process.standardInput = Pipe()
+            let stdin = Pipe()
+            process.standardInput = stdin
 
             process.terminationHandler = { process in
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
+                stdoutData.append(stdout.fileHandleForReading.readDataToEndOfFile())
+                stderrData.append(stderr.fileHandleForReading.readDataToEndOfFile())
                 let result = ShellResult(stdout: stdoutData.string(), stderr: stderrData.string())
-                if process.terminationStatus == 0 {
+                if runningProcess.wasCancelled() {
+                    continuation.resume(throwing: CancellationError())
+                } else if process.terminationStatus == 0 {
                     continuation.resume(returning: result)
                 } else {
                     let message = result.stderr.isEmpty ? result.stdout : result.stderr
@@ -171,11 +235,20 @@ enum ShellRunner {
 
             do {
                 try process.run()
+                setpgid(process.processIdentifier, process.processIdentifier)
+                runningProcess.attach(process)
+                if let standardInput {
+                    stdin.fileHandleForWriting.write(standardInput)
+                }
+                try? stdin.fileHandleForWriting.close()
             } catch {
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
                 continuation.resume(throwing: error)
             }
+            }
+        } onCancel: {
+            runningProcess.cancel()
         }
     }
 }

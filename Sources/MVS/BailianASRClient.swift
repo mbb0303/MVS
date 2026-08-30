@@ -19,9 +19,9 @@ final class BailianASRClient {
             RuntimePaths.pythonExecutable(),
             [script.path, "--model", model] + chunks.map(\.path),
             environment: [
-                "DASHSCOPE_API_KEY": apiKey,
                 "PYTHONPATH": dashscopePythonPath()
-            ]
+            ],
+            standardInput: Data((apiKey + "\n").utf8)
         ) { line in
             if line.hasPrefix("PROGRESS ") {
                 progress?(String(line.dropFirst("PROGRESS ".count)))
@@ -41,13 +41,6 @@ final class BailianASRClient {
 
     private func dashscopePythonPath() -> String {
         let bundled = RuntimePaths.pythonPackagePath(named: "dashscope-pkg") ?? ""
-        let current = ProcessInfo.processInfo.environment["PYTHONPATH"]
-        if bundled.isEmpty {
-            return current ?? ""
-        }
-        if let current, !current.isEmpty {
-            return "\(bundled):\(current)"
-        }
         return bundled
     }
 }

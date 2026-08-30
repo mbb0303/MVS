@@ -12,6 +12,12 @@ final class MVSPathsTests: XCTestCase {
         XCTAssertEqual(MVSPaths.relativePath(from: note, to: video), "../assets/URL/demo.mp4")
     }
 
+    func testPathContainmentUsesComponentBoundaries() {
+        let root = URL(fileURLWithPath: "/tmp/mvs/assets", isDirectory: true)
+        XCTAssertTrue(MVSPaths.isURL(URL(fileURLWithPath: "/tmp/mvs/assets/URL/video.mp4"), inside: root))
+        XCTAssertFalse(MVSPaths.isURL(URL(fileURLWithPath: "/tmp/mvs/assets-other/video.mp4"), inside: root))
+    }
+
     func testSourceLibraryDirectoryNames() {
         XCTAssertEqual(VideoSourceKind.url.libraryDirectoryName, "URL")
         XCTAssertEqual(VideoSourceKind.local.libraryDirectoryName, "Local")
@@ -115,5 +121,21 @@ final class MVSPathsTests: XCTestCase {
     func testJobArtifactIdentifiersIncludeKindAndPath() {
         let artifact = JobArtifact(kind: .summaryJSON, path: "/tmp/summary.json")
         XCTAssertEqual(artifact.id, "summaryJSON:/tmp/summary.json")
+    }
+
+
+    func testShellRunnerCancellationTerminatesProcess() async throws {
+        let task = Task {
+            try await ShellRunner.run("/bin/sleep", ["10"])
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected the process task to be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
     }
 }
