@@ -1,6 +1,8 @@
 .build/
 .swiftpm/
 .tools/
+.tools-staging.*/
+.tools-backup.*/
 DerivedData/
 dist/
 

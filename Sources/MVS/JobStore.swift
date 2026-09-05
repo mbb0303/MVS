@@ -9,12 +9,18 @@ final class JobStore: ObservableObject {
     @Published private(set) var jobs: [AnalysisJob] = []
     private var persistence: JobPersistence?
     private var runningTasks: [AnalysisJob.ID: Task<Void, Never>] = [:]
+    @Published private(set) var persistenceError: String?
+    private var configuredVault: URL?
+    private var lastProgressSave: [AnalysisJob.ID: Date] = [:]
 
     var hasActiveJobs: Bool {
-        jobs.contains { $0.status == .queued || $0.status == .running }
+        !runningTasks.isEmpty || jobs.contains { $0.status == .queued || $0.status == .running }
     }
 
-    func configure(settings: SettingsStore) {
+    func isTaskRunning(_ id: AnalysisJob.ID) -> Bool { runningTasks[id] != nil }
+
+    func configure(settings: any LibraryLocationProviding) {
+        guard !hasActiveJobs, configuredVault != settings.vaultURL.standardizedFileURL else { return }
         do {
             let database = try JobPersistence(vaultURL: settings.vaultURL)
             persistence = database
@@ -31,8 +37,10 @@ final class JobStore: ObservableObject {
             jobs = loaded
                 .filter { $0.status != .completed || Calendar.current.dateComponents([.day], from: $0.updatedAt, to: Date()).day ?? 0 < 7 }
                 .sorted { $0.updatedAt > $1.updatedAt }
+            configuredVault = settings.vaultURL.standardizedFileURL
+            persistenceError = nil
         } catch {
-            jobs = jobs
+            persistenceError = error.localizedDescription
         }
     }
 
@@ -40,25 +48,31 @@ final class JobStore: ObservableObject {
         var job = job
         job.updatedAt = Date()
         jobs.insert(job, at: 0)
-        try? persistence?.save(job)
+        persist(job)
     }
 
     func update(_ id: AnalysisJob.ID, _ mutate: (inout AnalysisJob) -> Void) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+        if runningTasks[id]?.isCancelled == true { return }
+        let previous = jobs[index]
         mutate(&jobs[index])
         jobs[index].updatedAt = Date()
-        try? persistence?.save(jobs[index])
+        let current = jobs[index]
+        if current.stage != previous.stage || current.status != previous.status
+            || current.videoURL != previous.videoURL || current.noteURL != previous.noteURL
+            || Date().timeIntervalSince(lastProgressSave[id] ?? .distantPast) >= 0.5 {
+            persist(current)
+            lastProgressSave[id] = Date()
+        }
     }
 
     func cancel(_ id: AnalysisJob.ID) {
-        runningTasks[id]?.cancel()
         update(id) {
             guard $0.status == .queued || $0.status == .running else { return }
-            $0.status = .cancelled
-            $0.stage = .failed
-            $0.progress = "Cancelled"
-            $0.canRetry = true
+            $0.progress = "Cancelling and cleaning up"
+            $0.canRetry = false
         }
+        runningTasks[id]?.cancel()
     }
 
     func job(with id: AnalysisJob.ID) -> AnalysisJob? {
@@ -70,20 +84,43 @@ final class JobStore: ObservableObject {
     }
 
     func detachTask(for id: AnalysisJob.ID) {
+        let cancelled = runningTasks[id]?.isCancelled == true
         runningTasks[id] = nil
+        if cancelled {
+            update(id) {
+                $0.status = .cancelled
+                $0.stage = .failed
+                $0.progress = "Cancelled"
+                $0.canRetry = true
+            }
+        }
     }
 
     func remove(_ id: AnalysisJob.ID) {
-        runningTasks[id]?.cancel()
-        runningTasks[id] = nil
+        guard runningTasks[id] == nil else { return }
         jobs.removeAll { $0.id == id }
         try? persistence?.delete(id)
+        if let vault = configuredVault {
+            let checkpoint = AnalysisCheckpoint.url(jobID: id, vault: vault)
+            if MVSPaths.isURL(checkpoint, inside: vault) { try? FileManager.default.removeItem(at: checkpoint) }
+        }
     }
 
     func clearHistory() {
         guard !hasActiveJobs else { return }
+        let ids = jobs.map(\.id)
+        for id in ids { remove(id) }
         jobs.removeAll()
         try? persistence?.deleteAll()
+    }
+
+    private func persist(_ job: AnalysisJob) {
+        do {
+            try persistence?.save(job)
+            persistenceError = nil
+        } catch {
+            persistenceError = error.localizedDescription
+        }
     }
 
     func renameProjects(mediaID: String, title: String) {
@@ -129,10 +166,18 @@ private final class JobPersistence {
     init(vaultURL: URL) throws {
         let directory = vaultURL.appendingPathComponent(".mvs", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard MVSPaths.isURL(directory, inside: vaultURL) else {
+            throw MVSError.processFailed("Jobs database directory is outside the library.")
+        }
         dbURL = directory.appendingPathComponent("jobs.sqlite")
         if sqlite3_open(dbURL.path, &db) != SQLITE_OK {
+            sqlite3_close(db)
+            db = nil
             throw MVSError.processFailed("Could not open jobs database at \(dbURL.path).")
         }
+        sqlite3_busy_timeout(db, 1000)
+        try execute("PRAGMA journal_mode=WAL;")
+        try execute("PRAGMA synchronous=NORMAL;")
         try execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY NOT NULL,
@@ -155,13 +200,16 @@ private final class JobPersistence {
         defer { sqlite3_finalize(statement) }
 
         var jobs: [AnalysisJob] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var status = sqlite3_step(statement)
+        while status == SQLITE_ROW {
+            defer { status = sqlite3_step(statement) }
             guard let raw = sqlite3_column_text(statement, 0) else { continue }
             let json = String(cString: raw)
             guard let data = json.data(using: .utf8),
                   let job = try? decoder.decode(AnalysisJob.self, from: data) else { continue }
             jobs.append(job)
         }
+        guard status == SQLITE_DONE else { throw databaseError() }
         return jobs
     }
 

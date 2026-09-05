@@ -20,8 +20,8 @@ elif security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"$LOCAL_S
 else
   SIGN_IDENTITY="-"
 fi
-APP_VERSION="${MVS_APP_VERSION:-0.4.0}"
-BUILD_NUMBER="${MVS_BUILD_NUMBER:-7}"
+APP_VERSION="${MVS_APP_VERSION:-0.4.1}"
+BUILD_NUMBER="${MVS_BUILD_NUMBER:-8}"
 
 if [[ ! -f "$ICON_SOURCE" ]]; then
   echo "Missing icon source: $ICON_SOURCE"
@@ -52,12 +52,18 @@ sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512@2x.png" >/dev/
 iconutil -c icns "$ICONSET_DIR" -o "$ICNS_PATH"
 
 cp "$ROOT_DIR/.build/release/MVS" "$MACOS_DIR/MVS"
+strip -S "$MACOS_DIR/MVS"
 chmod +x "$MACOS_DIR/MVS"
+cp -R "$ROOT_DIR/.build/release/MVS_MVS.bundle" "$RESOURCES_DIR/MVS_MVS.bundle"
 
 mkdir -p "$RESOURCES_DIR/scripts"
 cp "$ROOT_DIR/scripts/transcribe-bailian-asr.py" "$RESOURCES_DIR/scripts/transcribe-bailian-asr.py"
 chmod +x "$RESOURCES_DIR/scripts/transcribe-bailian-asr.py"
-cp -R "$ROOT_DIR/.tools" "$RESOURCES_DIR/.tools"
+mkdir -p "$RESOURCES_DIR/.tools"
+cp -R "$ROOT_DIR/.tools/yt-dlp-pkg" "$ROOT_DIR/.tools/dashscope-pkg" "$RESOURCES_DIR/.tools/"
+cp "$ROOT_DIR/scripts/yt-dlp-launcher.sh" "$RESOURCES_DIR/.tools/yt-dlp"
+cp "$ROOT_DIR/config/python-version" "$RESOURCES_DIR/.tools/python-version"
+chmod +x "$RESOURCES_DIR/.tools/yt-dlp"
 find "$RESOURCES_DIR/.tools" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$RESOURCES_DIR/.tools" -type f -name '*.pyc' -delete
 rm -rf "$RESOURCES_DIR/.tools/yt-dlp-pkg/share"
@@ -104,6 +110,14 @@ else
 fi
 
 while IFS= read -r -d '' nested_code; do
+  architectures="$(lipo -archs "$nested_code")"
+  if [[ "$architectures" == *arm64* && "$architectures" == *x86_64* ]]; then
+    lipo "$nested_code" -thin arm64 -output "$nested_code.arm64"
+    mv "$nested_code.arm64" "$nested_code"
+  elif [[ "$architectures" != *arm64* ]]; then
+    echo "Runtime dependency has no Apple Silicon slice: $nested_code" >&2
+    exit 1
+  fi
   codesign "${SIGN_ARGS[@]}" "$nested_code"
 done < <(find "$APP_DIR" -type f \( -name '*.so' -o -name '*.dylib' \) -print0)
 

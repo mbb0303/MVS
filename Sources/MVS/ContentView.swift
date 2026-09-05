@@ -48,9 +48,9 @@ struct ContentView: View {
         }
         .task {
             MediaProcessor.cleanupStaleTemporaryDirectories()
-            MediaProcessor.cleanupLegacyIntermediateAudio(in: settings.videoRootURL)
             jobs.configure(settings: settings)
             library.refresh(settings: settings)
+            await settings.prepareCredentials()
         }
         .onChange(of: settings.vaultPath) {
             jobs.configure(settings: settings)

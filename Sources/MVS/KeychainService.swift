@@ -1,7 +1,13 @@
 import Foundation
 import Security
+import LocalAuthentication
 
 final class KeychainService {
+    private var noninteractiveContext: LAContext {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return context
+    }
     private let service = "local.mbb.mvs"
     private let credentialsAccount = "mvs-credentials-v1"
 
@@ -51,7 +57,8 @@ final class KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account(for: provider),
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: noninteractiveContext
         ]
         return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
     }
@@ -81,7 +88,7 @@ final class KeychainService {
         guard status == errSecSuccess, let data = item as? Data else {
             throw MVSError.processFailed("Could not read credentials from Keychain: \(status)")
         }
-        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+        return try JSONDecoder().decode([String: String].self, from: data)
     }
 
     func saveCredentialStore(_ values: [String: String]) throws {
@@ -102,9 +109,10 @@ final class KeychainService {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
         ]
-        let status = SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
-            ? SecItemUpdate(query as CFDictionary, update as CFDictionary)
-            : SecItemAdd(attributes as CFDictionary, nil)
+        var status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            status = SecItemAdd(attributes as CFDictionary, nil)
+        }
         guard status == errSecSuccess else {
             throw MVSError.processFailed("Could not save credentials to Keychain: \(status)")
         }
@@ -115,7 +123,8 @@ final class KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: credentialsAccount,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: noninteractiveContext
         ]
         return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
     }
@@ -182,7 +191,8 @@ final class KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: transcriptionAccount(for: provider),
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: noninteractiveContext
         ]
         return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
     }

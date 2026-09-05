@@ -48,11 +48,11 @@ final class LibraryStore: ObservableObject {
             throw MVSError.processFailed("Unsupported library source folder.")
         }
         let name = try normalizedFolderComponent(rawName)
-        let parent = normalizedRelativeFolderPath(parentPath ?? "")
+        let parent = try normalizedRelativeFolderPath(parentPath ?? "")
         let relativePath = parent.isEmpty ? name : "\(parent)/\(name)"
         let root = settings.vaultURL.appendingPathComponent(sourceDirectoryName, isDirectory: true)
         let destination = root.appendingPathComponent(relativePath, isDirectory: true).standardizedFileURL
-        guard MVSPaths.isURL(destination, inside: root) else {
+        guard MVSPaths.isURL(root, inside: settings.vaultURL), MVSPaths.isURL(destination, inside: root) else {
             throw MVSError.processFailed("Folder must remain inside the MVS library.")
         }
         guard !fileManager.fileExists(atPath: destination.path) else {
@@ -64,6 +64,7 @@ final class LibraryStore: ObservableObject {
     }
 
     func renameProject(_ item: FinishedJob, to rawTitle: String, settings: any LibraryLocationProviding) throws {
+        try validateProject(item, settings: settings)
         let title = rawTitle
             .components(separatedBy: .newlines)
             .joined(separator: " ")
@@ -75,7 +76,7 @@ final class LibraryStore: ObservableObject {
         var markdown = try String(contentsOf: item.noteURL, encoding: .utf8)
         markdown = replaceYAMLValue("title", value: title, in: markdown)
         markdown = replaceFirstHeading(with: title, in: markdown)
-        try markdown.write(to: item.noteURL, atomically: true, encoding: .utf8)
+        var updates = [(item.noteURL, Data(markdown.utf8))]
 
         let metadataURL = item.noteURL
             .deletingPathExtension()
@@ -84,8 +85,9 @@ final class LibraryStore: ObservableObject {
            var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             object["title"] = title
             let updated = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-            try updated.write(to: metadataURL, options: .atomic)
+            updates.append((metadataURL, updated))
         }
+        try ArtifactTransaction.write(updates, directory: item.noteURL.deletingLastPathComponent())
         refresh(settings: settings)
     }
 
@@ -96,7 +98,8 @@ final class LibraryStore: ObservableObject {
         settings: any LibraryLocationProviding
     ) throws -> [String: String] {
         let root = sourceRoot(for: item.source, settings: settings)
-        let folderPath = normalizedRelativeFolderPath(rawFolderPath ?? "")
+        try validateProject(item, settings: settings)
+        let folderPath = try normalizedRelativeFolderPath(rawFolderPath ?? "")
         let destinationDirectory = folderPath.isEmpty
             ? root
             : root.appendingPathComponent(folderPath, isDirectory: true).standardizedFileURL
@@ -119,6 +122,8 @@ final class LibraryStore: ObservableObject {
                 try fileManager.moveItem(at: source, to: destination)
                 moved.append((source, destination))
             }
+            let newNote = destinationDirectory.appendingPathComponent(item.noteURL.lastPathComponent)
+            try updateVideoPath(in: newNote, videoURL: item.videoURL)
         } catch {
             for pair in moved.reversed() where fileManager.fileExists(atPath: pair.destination.path) {
                 try? fileManager.moveItem(at: pair.destination, to: pair.source)
@@ -129,22 +134,15 @@ final class LibraryStore: ObservableObject {
         let mapping = Dictionary(uniqueKeysWithValues: moved.map {
             ($0.source.standardizedFileURL.path, $0.destination.standardizedFileURL.path)
         })
-        if let newNotePath = mapping[item.noteURL.standardizedFileURL.path] {
-            let newNoteURL = URL(fileURLWithPath: newNotePath)
-            try updateVideoPath(in: newNoteURL, videoURL: item.videoURL)
-        }
-        removeEmptyParentFolders(startingAt: currentDirectory, stoppingAt: root)
         refresh(settings: settings)
         return mapping
     }
 
     func deleteProject(_ item: FinishedJob, settings: any LibraryLocationProviding) throws {
-        let root = sourceRoot(for: item.source, settings: settings)
-        let currentDirectory = item.noteURL.deletingLastPathComponent()
+        try validateProject(item, settings: settings)
         var targets = try projectFiles(for: item)
         if let videoURL = item.videoURL { targets.append(videoURL) }
         try trashSafely(targets, settings: settings)
-        removeEmptyParentFolders(startingAt: currentDirectory, stoppingAt: root)
         refresh(settings: settings)
     }
 
@@ -157,6 +155,12 @@ final class LibraryStore: ObservableObject {
         var targets = job.artifacts.map { URL(fileURLWithPath: $0.path) }
         if let noteURL = job.noteURL { targets.append(noteURL) }
         if let videoURL = job.videoURL { targets.append(videoURL) }
+        if let noteURL = job.noteURL {
+            targets += ProjectArtifacts.urls(for: noteURL)
+        }
+        guard targets.allSatisfy({ !fileManager.fileExists(atPath: $0.path) || (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }) else {
+            throw MVSError.processFailed("A job may only delete project files, not library folders.")
+        }
         let unique = Dictionary(grouping: targets, by: { $0.standardizedFileURL.path })
             .compactMap { $0.value.first }
         try trashSafely(unique, settings: settings)
@@ -182,6 +186,10 @@ final class LibraryStore: ObservableObject {
         try fileManager.createDirectory(at: settings.vaultURL, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: settings.videoRootURL, withIntermediateDirectories: true)
         for name in sourceDirectoryNames {
+            guard MVSPaths.isURL(settings.vaultURL.appendingPathComponent(name), inside: settings.vaultURL),
+                  MVSPaths.isURL(settings.videoRootURL.appendingPathComponent(name), inside: settings.videoRootURL) else {
+                throw MVSError.processFailed("A source folder points outside the MVS library.")
+            }
             try fileManager.createDirectory(
                 at: settings.vaultURL.appendingPathComponent(name, isDirectory: true),
                 withIntermediateDirectories: true
@@ -193,12 +201,15 @@ final class LibraryStore: ObservableObject {
         }
         try migrateAssetDirectory(from: "from URL", to: "URL", settings: settings)
         try migrateAssetDirectory(from: "from Meeting", to: "Meeting", settings: settings)
-        try updateLegacyNoteReferences(settings: settings)
     }
 
     private func migrateAssetDirectory(from oldName: String, to newName: String, settings: any LibraryLocationProviding) throws {
         let oldURL = settings.videoRootURL.appendingPathComponent(oldName, isDirectory: true)
         guard fileManager.fileExists(atPath: oldURL.path) else { return }
+        guard MVSPaths.isURL(oldURL, inside: settings.videoRootURL),
+              (try oldURL.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else {
+            throw MVSError.processFailed("Legacy media folder points outside the MVS library.")
+        }
         let newURL = settings.videoRootURL.appendingPathComponent(newName, isDirectory: true)
         try fileManager.createDirectory(at: newURL, withIntermediateDirectories: true)
         let children = try fileManager.contentsOfDirectory(at: oldURL, includingPropertiesForKeys: nil)
@@ -209,29 +220,13 @@ final class LibraryStore: ObservableObject {
         try? fileManager.removeItem(at: oldURL)
     }
 
-    private func updateLegacyNoteReferences(settings: any LibraryLocationProviding) throws {
-        for directoryName in sourceDirectoryNames {
-            let directory = settings.vaultURL.appendingPathComponent(directoryName, isDirectory: true)
-            for note in recursiveFiles(in: directory) where note.pathExtension.lowercased() == "md" {
-                var content = try String(contentsOf: note, encoding: .utf8)
-                let updated = content
-                    .replacingOccurrences(of: "assets/from URL", with: "assets/URL")
-                    .replacingOccurrences(of: "assets/from Meeting", with: "assets/Meeting")
-                if updated != content {
-                    content = updated
-                    try content.write(to: note, atomically: true, encoding: .utf8)
-                }
-            }
-        }
-    }
-
     private func scanFinishedJobs(settings: any LibraryLocationProviding) throws -> [FinishedJob] {
         var items: [FinishedJob] = []
         for (directoryName, source) in noteDirectories {
             let root = settings.vaultURL.appendingPathComponent(directoryName, isDirectory: true)
             guard fileManager.fileExists(atPath: root.path) else { continue }
             for note in recursiveFiles(in: root).filter({ isPrimaryNoteURL($0) }) {
-                let content = (try? String(contentsOf: note, encoding: .utf8)) ?? ""
+                let content = readHeader(note)
                 let title = extractYAMLValue("title", from: content)
                     ?? note.deletingPathExtension().lastPathComponent
                 let storedSource = extractYAMLValue("source", from: content)
@@ -239,7 +234,8 @@ final class LibraryStore: ObservableObject {
                     ?? source
                 let videoURL = resolveVideoPath(from: content, noteURL: note)
                 let mediaID = extractYAMLValue("media_id", from: content)
-                let created = try? note.resourceValues(forKeys: [.creationDateKey]).creationDate
+                let created = extractYAMLValue("created", from: content).flatMap { ISO8601DateFormatter().date(from: $0) }
+                    ?? (try? note.resourceValues(forKeys: [.creationDateKey]).creationDate)
                 items.append(FinishedJob(
                     id: note.standardizedFileURL.path,
                     title: title,
@@ -269,7 +265,6 @@ final class LibraryStore: ObservableObject {
         referencedMediaIDs: Set<String>
     ) throws -> [PendingVideoSummary] {
         var items: [PendingVideoSummary] = []
-        let referencedMediaIDs = referencedMediaIDs.union(referencedVideos.map { mediaID(fromPath: $0) })
         for (directoryName, source) in assetDirectories {
             let directory = settings.videoRootURL.appendingPathComponent(directoryName, isDirectory: true)
             guard fileManager.fileExists(atPath: directory.path) else { continue }
@@ -303,6 +298,11 @@ final class LibraryStore: ObservableObject {
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
             for case let url as URL in enumerator {
+                guard MVSPaths.isURL(url, inside: root),
+                      (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+                    enumerator.skipDescendants()
+                    continue
+                }
                 let isDirectory = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
                 guard isDirectory else { continue }
                 results.append(LibraryFolder(
@@ -327,18 +327,24 @@ final class LibraryStore: ObservableObject {
     }
 
     private func projectFiles(for item: FinishedJob) throws -> [URL] {
-        let directory = item.noteURL.deletingLastPathComponent()
-        let stem = item.noteURL.deletingPathExtension().lastPathComponent
-        return try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )
-        .filter { url in
-            let name = url.lastPathComponent
-            return name == "\(stem).md" || name.hasPrefix("\(stem).")
+        try ProjectArtifacts.urls(for: item.noteURL).filter { url in
+            guard fileManager.fileExists(atPath: url.path) else { return false }
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw MVSError.processFailed("Project artifacts must be regular files: \(url.lastPathComponent)")
+            }
+            return true
         }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func validateProject(_ item: FinishedJob, settings: any LibraryLocationProviding) throws {
+        let root = sourceRoot(for: item.source, settings: settings)
+        guard MVSPaths.isURL(root, inside: settings.vaultURL), MVSPaths.isURL(item.noteURL, inside: root) else {
+            throw MVSError.processFailed("Project must remain inside its MVS source folder.")
+        }
+        for url in try projectFiles(for: item) where !MVSPaths.isURL(url, inside: root) {
+            throw MVSError.processFailed("Project artifact points outside its source folder: \(url.lastPathComponent)")
+        }
     }
 
     private func trashSafely(_ urls: [URL], settings: any LibraryLocationProviding) throws {
@@ -352,6 +358,19 @@ final class LibraryStore: ObservableObject {
 
         for target in targets {
             let path = target.path
+            let managedRoots = sourceDirectoryNames.flatMap {
+                [settings.vaultURL.appendingPathComponent($0), settings.videoRootURL.appendingPathComponent($0)]
+            }
+            guard managedRoots.contains(where: {
+                (MVSPaths.isURL($0, inside: settings.vaultURL) || MVSPaths.isURL($0, inside: settings.videoRootURL))
+                    && MVSPaths.isURL(target, inside: $0)
+            }) else {
+                throw MVSError.processFailed("Refusing to delete a file outside the managed media and note folders.")
+            }
+            guard target.resolvingSymlinksInPath() != settings.vaultURL.resolvingSymlinksInPath(),
+                  target.resolvingSymlinksInPath() != settings.videoRootURL.resolvingSymlinksInPath() else {
+                throw MVSError.processFailed("Refusing to delete a library root.")
+            }
             guard MVSPaths.isURL(target, inside: settings.vaultURL)
                     || MVSPaths.isURL(target, inside: settings.videoRootURL) else {
                 throw MVSError.processFailed("Refusing to delete a file outside the MVS library: \(path)")
@@ -372,6 +391,11 @@ final class LibraryStore: ObservableObject {
         ) else { return [] }
         var files: [URL] = []
         for case let url as URL in enumerator {
+            guard MVSPaths.isURL(url, inside: root),
+                  (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+                enumerator.skipDescendants()
+                continue
+            }
             if (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
                 files.append(url)
             }
@@ -380,38 +404,11 @@ final class LibraryStore: ObservableObject {
     }
 
     private func extractYAMLValue(_ key: String, from content: String) -> String? {
-        let escapedKey = NSRegularExpression.escapedPattern(for: key)
-        let pattern = "(?m)^\(escapedKey):\\s*\"?([^\"\\n]+)\"?\\s*$"
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(
-                in: content,
-                range: NSRange(content.startIndex..<content.endIndex, in: content)
-              ),
-              match.numberOfRanges > 1,
-              let range = Range(match.range(at: 1), in: content) else {
-            return nil
-        }
-        return String(content[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        NoteFrontMatter(content).value(key)
     }
 
     private func replaceYAMLValue(_ key: String, value: String, in content: String) -> String {
-        let escapedValue = value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let replacement = "\(key): \"\(escapedValue)\""
-        let escapedKey = NSRegularExpression.escapedPattern(for: key)
-        let pattern = "(?m)^\(escapedKey):\\s*.*$"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return content }
-        let range = NSRange(content.startIndex..<content.endIndex, in: content)
-        if regex.firstMatch(in: content, range: range) != nil {
-            return regex.stringByReplacingMatches(
-                in: content,
-                range: range,
-                withTemplate: NSRegularExpression.escapedTemplate(for: replacement)
-            )
-        }
-        guard let opening = content.range(of: "---\n") else { return content }
-        return content.replacingCharacters(in: opening, with: "---\n\(replacement)\n")
+        NoteFrontMatter(content).setting(key, to: value)
     }
 
     private func replaceFirstHeading(with title: String, in content: String) -> String {
@@ -429,9 +426,15 @@ final class LibraryStore: ObservableObject {
     private func updateVideoPath(in noteURL: URL, videoURL: URL?) throws {
         guard let videoURL else { return }
         var content = try String(contentsOf: noteURL, encoding: .utf8)
+        let oldPath = NoteFrontMatter(content).value("video_path")
+        let newPath = MVSPaths.relativePath(from: noteURL, to: videoURL)
+        if let oldPath, !oldPath.isEmpty {
+            content = content.replacingOccurrences(of: "![](\(oldPath))", with: "![](<\(newPath)>)")
+                .replacingOccurrences(of: "![](<\(oldPath)>)", with: "![](<\(newPath)>)")
+        }
         content = replaceYAMLValue(
             "video_path",
-            value: MVSPaths.relativePath(from: noteURL, to: videoURL),
+            value: newPath,
             in: content
         )
         try content.write(to: noteURL, atomically: true, encoding: .utf8)
@@ -446,9 +449,11 @@ final class LibraryStore: ObservableObject {
     }
 
     private func resolveVideoPath(from content: String, noteURL: URL) -> URL? {
-        guard let value = extractYAMLValue("video_path", from: content), !value.isEmpty else {
+        guard let stored = extractYAMLValue("video_path", from: content), !stored.isEmpty else {
             return nil
         }
+        let value = stored.replacingOccurrences(of: "assets/from URL", with: "assets/URL")
+            .replacingOccurrences(of: "assets/from Meeting", with: "assets/Meeting")
         if value.hasPrefix("/") {
             return URL(fileURLWithPath: value)
         }
@@ -458,6 +463,12 @@ final class LibraryStore: ObservableObject {
             .standardizedFileURL
     }
 
+    private func readHeader(_ url: URL) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: 64 * 1024)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+    }
+
     private func inferredMediaID(noteURL: URL, title: String, videoURL: URL?) -> String {
         if let videoURL { return mediaID(from: videoURL) }
         let noteID = Self.normalizedMediaID(noteURL.deletingPathExtension().lastPathComponent)
@@ -465,7 +476,7 @@ final class LibraryStore: ObservableObject {
     }
 
     private func mediaID(from url: URL) -> String {
-        Self.normalizedMediaID(url.deletingPathExtension().lastPathComponent)
+        url.deletingPathExtension().lastPathComponent
     }
 
     private func mediaID(fromPath path: String) -> String {
@@ -494,12 +505,12 @@ final class LibraryStore: ObservableObject {
         return String(value.prefix(80))
     }
 
-    private func normalizedRelativeFolderPath(_ rawPath: String) -> String {
-        rawPath
-            .split(separator: "/")
-            .map(String.init)
-            .filter { !$0.isEmpty && $0 != "." && $0 != ".." }
-            .joined(separator: "/")
+    private func normalizedRelativeFolderPath(_ rawPath: String) throws -> String {
+        let components = rawPath.split(separator: "/").map(String.init)
+        guard !rawPath.hasPrefix("/"), components.allSatisfy({ !$0.hasPrefix(".") && !$0.contains(":") && !$0.contains("\0") }) else {
+            throw MVSError.processFailed("Invalid library folder path.")
+        }
+        return components.joined(separator: "/")
     }
 
     private func relativeFolderPath(from root: URL, to directory: URL) -> String {
@@ -507,17 +518,6 @@ final class LibraryStore: ObservableObject {
         let targetComponents = directory.standardizedFileURL.pathComponents
         guard targetComponents.starts(with: rootComponents) else { return "" }
         return targetComponents.dropFirst(rootComponents.count).joined(separator: "/")
-    }
-
-    private func removeEmptyParentFolders(startingAt directory: URL, stoppingAt root: URL) {
-        var candidate = directory.standardizedFileURL
-        let rootPath = root.standardizedFileURL.path
-        while candidate.path != rootPath, MVSPaths.isURL(candidate, inside: root) {
-            guard let children = try? fileManager.contentsOfDirectory(at: candidate, includingPropertiesForKeys: nil),
-                  children.isEmpty else { break }
-            try? fileManager.removeItem(at: candidate)
-            candidate.deleteLastPathComponent()
-        }
     }
 
     private func uniqueURL(_ url: URL) -> URL {

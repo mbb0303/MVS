@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
+import math
 import sys
 import time
 import wave
@@ -51,6 +51,9 @@ def extract_text_and_segments(result, chunk_index):
             pass
 
     output = data.get("output") if isinstance(data, dict) else None
+    sentence_list = next((item for item in candidates if isinstance(item, list)), None)
+    if sentence_list is not None and not isinstance(output, dict):
+        output = {"sentence": sentence_list}
     if isinstance(output, dict):
         for key in ("sentence", "text"):
             if isinstance(output.get(key), str):
@@ -71,8 +74,8 @@ def extract_text_and_segments(result, chunk_index):
                 if not text:
                     continue
                 parts.append(text)
-                begin = item.get("begin_time") or item.get("start_time") or item.get("start")
-                end = item.get("end_time") or item.get("end")
+                begin = next((item[k] for k in ("begin_time", "start_time", "start") if item.get(k) is not None), None)
+                end = next((item[k] for k in ("end_time", "end") if item.get(k) is not None), None)
                 segments.append(
                     {
                         "id": f"bailian-{chunk_index}-{index}",
@@ -86,8 +89,6 @@ def extract_text_and_segments(result, chunk_index):
                 return "\n".join(parts), segments
 
     text = next((item.strip() for item in candidates if isinstance(item, str) and item.strip()), "")
-    if not text and isinstance(data, dict):
-        text = json.dumps(data, ensure_ascii=False)
     segment = {
         "id": f"bailian-{chunk_index}-0",
         "start": None,
@@ -129,11 +130,11 @@ def milliseconds_to_seconds(value):
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number / 1000.0 if number > 1000 else number
+    return number / 1000.0 if math.isfinite(number) and number >= 0 else None
 
 
 def speaker_value(item):
-    value = item.get("speaker") or item.get("speaker_id")
+    value = item.get("speaker") if item.get("speaker") is not None else item.get("speaker_id")
     return None if value is None else str(value)
 
 

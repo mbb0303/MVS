@@ -157,6 +157,7 @@ struct NewTaskView: View {
                 Text("Screen").tag(VideoSourceKind.screenRecording)
             }
             .pickerStyle(.segmented)
+            .disabled(recorder.isBusy)
             .onChange(of: recorder.meetingSource) {
                 Task { await recorder.refreshTargets() }
             }
@@ -181,6 +182,7 @@ struct NewTaskView: View {
                 .buttonStyle(MVSSecondaryButtonStyle())
                 .help("Refresh capture targets")
             }
+            .disabled(recorder.isBusy)
 
             HStack(spacing: 10) {
                 Label("System audio", systemImage: "speaker.wave.2.fill")
@@ -191,6 +193,7 @@ struct NewTaskView: View {
                     .controlSize(.small)
                 Spacer()
             }
+            .disabled(recorder.isBusy)
 
             HStack(spacing: 10) {
                 MVSEnergyCore(active: recorder.isRecording)
@@ -204,7 +207,7 @@ struct NewTaskView: View {
                             if let recording = await recorder.stopRecording() {
                                 pipeline.analyzeRecording(
                                     recording,
-                                    source: recorder.meetingSource,
+                                    source: recorder.recordingSource,
                                     settings: settings,
                                     jobs: jobs,
                                     library: library
@@ -216,6 +219,7 @@ struct NewTaskView: View {
                         Label("Stop and Analyze", systemImage: "stop.fill")
                     }
                     .buttonStyle(MVSPrimaryButtonStyle())
+                    .disabled(recorder.isStopping)
                 } else {
                     Button {
                         Task { await recorder.startRecording(settings: settings) }
@@ -223,7 +227,7 @@ struct NewTaskView: View {
                         Label("Start Recording", systemImage: "record.circle")
                     }
                     .buttonStyle(MVSPrimaryButtonStyle())
-                    .disabled(!recorder.screenPermissionGranted || recorder.selectedTargetID == nil)
+                    .disabled(recorder.isBusy || !recorder.screenPermissionGranted || recorder.selectedTargetID == nil)
                 }
             }
 

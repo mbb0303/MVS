@@ -1,6 +1,13 @@
 import Foundation
 
 enum SummaryJSONDecoder {
+    static func decodeComplete(from text: String) throws -> SummaryResult {
+        let cleaned = clean(text)
+        guard let result = tryDecodeStrict(cleaned), !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MVSError.processFailed("Summary was incomplete or malformed. Output: \(DiagnosticRedactor.redact(String(cleaned.prefix(1000))))")
+        }
+        return result
+    }
     static func decode(from text: String) throws -> SummaryResult {
         let cleaned = clean(text)
         let candidates = [balancedJSONObject(in: cleaned), cleaned].compactMap { $0 }

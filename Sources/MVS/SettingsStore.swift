@@ -8,7 +8,12 @@ protocol LibraryLocationProviding {
 }
 
 @MainActor
-final class SettingsStore: ObservableObject, LibraryLocationProviding {
+protocol NoteWritingSettings: LibraryLocationProviding {
+    var summaryModel: String { get }
+}
+
+@MainActor
+final class SettingsStore: ObservableObject, NoteWritingSettings {
     @Published var vaultPath: String {
         didSet { defaults.set(vaultPath, forKey: Keys.vaultPath) }
     }
@@ -81,11 +86,15 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
 
     private let defaults: UserDefaults
     private let keychain = KeychainService()
+    private let credentialLoader: @Sendable () throws -> [String: String]
+    private var credentialLoadTask: Task<[String: String], Error>?
+    @Published private(set) var isUpdatingCredentials = false
     private var cachedAPIKeys: [AIProvider: String] = [:]
     private var cachedTranscriptionAPIKeys: [TranscriptionProvider: String] = [:]
     private var didLoadCredentialStore = false
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, credentialLoader: @escaping @Sendable () throws -> [String: String] = { try KeychainService().loadCredentialStore() }) {
+        self.credentialLoader = credentialLoader
         self.defaults = defaults
         let savedVault = defaults.string(forKey: Keys.vaultPath)
         let vault = MVSPaths.shouldMoveLegacyDefaultPath(savedVault) ? MVSPaths.defaultLibraryPath : savedVault ?? MVSPaths.defaultLibraryPath
@@ -124,22 +133,38 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
         } else {
             self.enableDiarizationForMeetings = defaults.bool(forKey: Keys.enableDiarizationForMeetings)
         }
+        defaults.set(vaultPath, forKey: Keys.vaultPath)
+        defaults.set(videoRootPath, forKey: Keys.videoRootPath)
+    }
+
+    func prepareCredentials() async {
         do {
-            try loadUnifiedCredentialStoreIfNeeded()
+            try await loadUnifiedCredentialStoreIfNeeded()
+            refreshAPIKeyState()
+            lastSettingsError = nil
         } catch {
             lastSettingsError = error.localizedDescription
         }
-        refreshAPIKeyState()
-        defaults.set(vaultPath, forKey: Keys.vaultPath)
-        defaults.set(videoRootPath, forKey: Keys.videoRootPath)
+    }
+
+    func retryCredentialAccess() async {
+        guard !isUpdatingCredentials else { return }
+        credentialLoadTask = nil
+        didLoadCredentialStore = false
+        await prepareCredentials()
     }
 
     var vaultURL: URL { URL(fileURLWithPath: vaultPath, isDirectory: true) }
     var videoRootURL: URL { URL(fileURLWithPath: videoRootPath, isDirectory: true) }
 
-    func saveAPIKey(_ key: String, provider: AIProvider) {
+    func saveAPIKey(_ key: String, provider: AIProvider) async {
+        guard !isUpdatingCredentials else { return }
+        isUpdatingCredentials = true
+        defer { isUpdatingCredentials = false }
         do {
-            try loadUnifiedCredentialStoreIfNeeded()
+            try await loadUnifiedCredentialStoreIfNeeded()
+            let previousKeys = cachedAPIKeys
+            let previousTranscriptionKeys = cachedTranscriptionAPIKeys
             let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
             cachedAPIKeys[provider] = trimmed
             if provider == .openAI {
@@ -147,7 +172,13 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
             } else if provider == .bailianQwen {
                 cachedTranscriptionAPIKeys[.bailianASR] = trimmed
             }
-            try saveUnifiedCredentialStore()
+            do {
+                try await saveUnifiedCredentialStore()
+            } catch {
+                cachedAPIKeys = previousKeys
+                cachedTranscriptionAPIKeys = previousTranscriptionKeys
+                throw error
+            }
             lastSettingsError = nil
             refreshAPIKeyState()
         } catch {
@@ -155,15 +186,15 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
         }
     }
 
-    func loadAPIKey(provider: AIProvider) throws -> String {
+    func loadAPIKey(provider: AIProvider) async throws -> String {
         if let cached = cachedAPIKeys[provider], !cached.isEmpty {
             return cached
         }
-        try loadUnifiedCredentialStoreIfNeeded()
+        try await loadUnifiedCredentialStoreIfNeeded()
         if let cached = cachedAPIKeys[provider], !cached.isEmpty {
             return cached
         }
-        guard let key = try keychain.loadAPIKey(provider: provider), !key.isEmpty else {
+        guard let key = try await Task.detached(operation: { try KeychainService().loadAPIKey(provider: provider) }).value, !key.isEmpty else {
             throw MVSError.missingAPIKey(provider.displayName)
         }
         cachedAPIKeys[provider] = key
@@ -172,51 +203,53 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
         } else if provider == .bailianQwen {
             cachedTranscriptionAPIKeys[.bailianASR] = key
         }
-        try saveUnifiedCredentialStore()
-        keychain.deleteAPIKey(provider: provider)
+        try await saveUnifiedCredentialStore()
+        await Task.detached { KeychainService().deleteAPIKey(provider: provider) }.value
         return key
     }
 
-    func clearAPIKey(provider: AIProvider) {
-        try? loadUnifiedCredentialStoreIfNeeded()
-        keychain.deleteAPIKey(provider: provider)
-        cachedAPIKeys[provider] = nil
-        if provider == .openAI {
-            cachedTranscriptionAPIKeys[.openAI] = nil
-        } else if provider == .bailianQwen {
-            cachedTranscriptionAPIKeys[.bailianASR] = nil
-        }
-        try? saveUnifiedCredentialStore()
-        refreshAPIKeyState()
-    }
-
-    func saveTranscriptionAPIKey(_ key: String, provider: TranscriptionProvider) {
+    func clearAPIKey(provider: AIProvider) async {
+        guard !isUpdatingCredentials else { return }
+        isUpdatingCredentials = true
+        defer { isUpdatingCredentials = false }
         do {
-            try loadUnifiedCredentialStoreIfNeeded()
-            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-            cachedTranscriptionAPIKeys[provider] = trimmed
+            try await loadUnifiedCredentialStoreIfNeeded()
+            let oldAPIKeys = cachedAPIKeys
+            let oldTranscriptionKeys = cachedTranscriptionAPIKeys
+            cachedAPIKeys[provider] = nil
             if provider == .openAI {
-                cachedAPIKeys[.openAI] = trimmed
-            } else if provider == .bailianASR {
-                cachedAPIKeys[.bailianQwen] = trimmed
+                cachedTranscriptionAPIKeys[.openAI] = nil
+            } else if provider == .bailianQwen {
+                cachedTranscriptionAPIKeys[.bailianASR] = nil
             }
-            try saveUnifiedCredentialStore()
-            lastSettingsError = nil
+            do {
+                try await saveUnifiedCredentialStore()
+                await Task.detached { KeychainService().deleteAPIKey(provider: provider) }.value
+                lastSettingsError = nil
+            } catch {
+                cachedAPIKeys = oldAPIKeys
+                cachedTranscriptionAPIKeys = oldTranscriptionKeys
+                throw error
+            }
             refreshAPIKeyState()
         } catch {
             lastSettingsError = error.localizedDescription
         }
     }
 
-    func loadTranscriptionAPIKey(provider: TranscriptionProvider) throws -> String {
+    func saveTranscriptionAPIKey(_ key: String, provider: TranscriptionProvider) async {
+        await saveAPIKey(key, provider: provider == .openAI ? .openAI : .bailianQwen)
+    }
+
+    func loadTranscriptionAPIKey(provider: TranscriptionProvider) async throws -> String {
         if let cached = cachedTranscriptionAPIKeys[provider], !cached.isEmpty {
             return cached
         }
-        try loadUnifiedCredentialStoreIfNeeded()
+        try await loadUnifiedCredentialStoreIfNeeded()
         if let cached = cachedTranscriptionAPIKeys[provider], !cached.isEmpty {
             return cached
         }
-        guard let key = try keychain.loadTranscriptionAPIKey(provider: provider), !key.isEmpty else {
+        guard let key = try await Task.detached(operation: { try KeychainService().loadTranscriptionAPIKey(provider: provider) }).value, !key.isEmpty else {
             throw MVSError.missingAPIKey(provider.displayName)
         }
         cachedTranscriptionAPIKeys[provider] = key
@@ -225,33 +258,30 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
         } else if provider == .bailianASR {
             cachedAPIKeys[.bailianQwen] = key
         }
-        try saveUnifiedCredentialStore()
-        keychain.deleteTranscriptionAPIKey(provider: provider)
+        try await saveUnifiedCredentialStore()
+        await Task.detached { KeychainService().deleteTranscriptionAPIKey(provider: provider) }.value
         return key
     }
 
-    func clearTranscriptionAPIKey(provider: TranscriptionProvider) {
-        try? loadUnifiedCredentialStoreIfNeeded()
-        keychain.deleteTranscriptionAPIKey(provider: provider)
-        cachedTranscriptionAPIKeys[provider] = nil
-        if provider == .openAI {
-            cachedAPIKeys[.openAI] = nil
-        } else if provider == .bailianASR {
-            cachedAPIKeys[.bailianQwen] = nil
-        }
-        try? saveUnifiedCredentialStore()
-        refreshAPIKeyState()
+    func clearTranscriptionAPIKey(provider: TranscriptionProvider) async {
+        await clearAPIKey(provider: provider == .openAI ? .openAI : .bailianQwen)
     }
 
     func refreshAPIKeyState() {
-        hasAPIKey = cachedAPIKeys[.openAI]?.isEmpty == false || keychain.hasAPIKey(provider: .openAI)
-        hasDeepSeekAPIKey = cachedAPIKeys[.deepSeek]?.isEmpty == false || keychain.hasAPIKey(provider: .deepSeek)
-        hasBailianASRAPIKey = cachedTranscriptionAPIKeys[.bailianASR]?.isEmpty == false || keychain.hasTranscriptionAPIKey(provider: .bailianASR)
+        hasAPIKey = cachedAPIKeys[.openAI]?.isEmpty == false
+        hasDeepSeekAPIKey = cachedAPIKeys[.deepSeek]?.isEmpty == false
+        hasBailianASRAPIKey = cachedTranscriptionAPIKeys[.bailianASR]?.isEmpty == false
     }
 
-    private func loadUnifiedCredentialStoreIfNeeded() throws {
+    private func loadUnifiedCredentialStoreIfNeeded() async throws {
         guard !didLoadCredentialStore else { return }
-        let values = try keychain.loadCredentialStore()
+        if credentialLoadTask == nil {
+            let loader = credentialLoader
+            credentialLoadTask = Task.detached(priority: .userInitiated) { try loader() }
+        }
+        guard let credentialLoadTask else { return }
+        let values = try await credentialLoadTask.value
+        guard !didLoadCredentialStore else { return }
         for provider in AIProvider.allCases {
             if let value = values[keychain.credentialKey(for: provider)], !value.isEmpty {
                 cachedAPIKeys[provider] = value
@@ -265,7 +295,7 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
         didLoadCredentialStore = true
     }
 
-    private func saveUnifiedCredentialStore() throws {
+    private func saveUnifiedCredentialStore() async throws {
         var values: [String: String] = [:]
         for (provider, key) in cachedAPIKeys where !key.isEmpty {
             values[keychain.credentialKey(for: provider)] = key
@@ -273,7 +303,8 @@ final class SettingsStore: ObservableObject, LibraryLocationProviding {
         for (provider, key) in cachedTranscriptionAPIKeys where !key.isEmpty {
             values[keychain.credentialKey(for: provider)] = key
         }
-        try keychain.saveCredentialStore(values)
+        let snapshot = values
+        try await Task.detached { try KeychainService().saveCredentialStore(snapshot) }.value
     }
 
     func resetVideoRootToVaultDefault() {

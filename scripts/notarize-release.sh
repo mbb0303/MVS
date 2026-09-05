@@ -11,6 +11,12 @@ if [[ -z "$SIGN_IDENTITY" || "$SIGN_IDENTITY" == "-" ]]; then
 fi
 
 MVS_SIGN_IDENTITY="$SIGN_IDENTITY" "$ROOT_DIR/scripts/build-app.sh"
+APP_DIR="$(cd "$ROOT_DIR/dist/MVS.app" && pwd -P)"
+APP_ARCHIVE="$ROOT_DIR/dist/MVS-notary.zip"
+ditto -c -k --keepParent "$APP_DIR" "$APP_ARCHIVE"
+xcrun notarytool submit "$APP_ARCHIVE" --keychain-profile "$NOTARY_PROFILE" --wait
+xcrun stapler staple "$APP_DIR"
+xcrun stapler validate "$APP_DIR"
 MVS_SIGN_IDENTITY="$SIGN_IDENTITY" "$ROOT_DIR/scripts/build-dmg.sh"
 
 xcrun notarytool submit "$ROOT_DIR/dist/MVS.dmg" \

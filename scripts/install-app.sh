@@ -13,9 +13,20 @@ if [[ -L "$APP_LINK" ]]; then
   APP_SOURCE="$(readlink "$APP_LINK")"
 fi
 
-rm -rf /Applications/MVS.app
-ditto --noextattr "$APP_SOURCE" /Applications/MVS.app
-xattr -cr /Applications/MVS.app
-codesign --verify --deep --strict --verbose=2 /Applications/MVS.app
+STAGING_DIR="$(mktemp -d /Applications/.MVS-install.XXXXXX)"
+cleanup() {
+  if [[ ! -e /Applications/MVS.app && -d "$STAGING_DIR/previous.app" ]]; then
+    mv "$STAGING_DIR/previous.app" /Applications/MVS.app
+  fi
+  rm -rf "$STAGING_DIR"
+}
+trap cleanup EXIT
+ditto --noextattr "$APP_SOURCE" "$STAGING_DIR/MVS.app"
+xattr -cr "$STAGING_DIR/MVS.app"
+codesign --verify --deep --strict --verbose=2 "$STAGING_DIR/MVS.app"
+if [[ -e /Applications/MVS.app ]]; then
+  mv /Applications/MVS.app "$STAGING_DIR/previous.app"
+fi
+mv "$STAGING_DIR/MVS.app" /Applications/MVS.app
 
 echo /Applications/MVS.app

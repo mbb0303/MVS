@@ -32,6 +32,13 @@ struct JobsView: View {
             .padding(.horizontal, 24)
             .padding(.top, 24)
 
+            if let error = jobs.persistenceError {
+                Text("Could not save task history: \(error)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(MVSTheme.danger)
+                    .padding(.horizontal, 24)
+            }
+
             HSplitView {
                 jobList
                     .frame(minWidth: 310, idealWidth: 350, maxWidth: 430)
@@ -126,6 +133,10 @@ struct JobsView: View {
     }
 
     private func deleteJobAndFiles(_ job: AnalysisJob) {
+        guard !jobs.hasActiveJobs else {
+            operationError = "Wait for active jobs to finish before deleting project files."
+            return
+        }
         do {
             try library.deleteArtifacts(for: job, settings: settings)
             jobs.remove(job.id)
@@ -153,28 +164,7 @@ struct JobsView: View {
     }
 
     private func retry(_ job: AnalysisJob) {
-        jobs.remove(job.id)
-        if job.source == .url, let sourceURL = job.sourceURL {
-            pipeline.analyzeURL(
-                sourceURL,
-                options: URLAnalysisOptions(
-                    keepDownloadedVideo: false,
-                    preferPlatformSubtitles: settings.preferPlatformSubtitles,
-                    forceASR: settings.forceASRForURL
-                ),
-                settings: settings,
-                jobs: jobs,
-                library: library
-            )
-        } else if let videoURL = job.videoURL {
-            pipeline.summarizeArchivedVideo(
-                videoURL,
-                source: job.source,
-                settings: settings,
-                jobs: jobs,
-                library: library
-            )
-        }
+        pipeline.retry(job, settings: settings, jobs: jobs, library: library)
         selection = jobs.jobs.first?.id
     }
 }
@@ -339,7 +329,7 @@ private struct JobDetailView: View {
             if job.canRetry {
                 Button(action: retry) { Label("Retry", systemImage: "arrow.clockwise") }
                     .buttonStyle(MVSPrimaryButtonStyle())
-                    .disabled(job.sourceURL == nil && job.videoURL == nil)
+                    .disabled(job.sourceURL == nil && job.videoURL == nil && job.originalFileURL == nil)
             }
             if let note = job.noteURL {
                 Button {

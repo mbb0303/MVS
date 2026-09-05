@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var jobs: JobStore
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var recorder: RecordingController
 
     @State private var openAIAPIKey = ""
     @State private var deepSeekAPIKey = ""
@@ -31,6 +32,7 @@ struct SettingsView: View {
         }
         .padding(.top, 8)
         .background(MVSTheme.canvas)
+        .disabled(jobs.hasActiveJobs || recorder.isBusy)
         .confirmationDialog(
             "Erase all MVS history?",
             isPresented: $confirmEraseHistory,
@@ -114,10 +116,12 @@ struct SettingsView: View {
                     configured: settings.hasAPIKey,
                     value: $openAIAPIKey,
                     save: {
-                        settings.saveAPIKey(openAIAPIKey, provider: .openAI)
-                        openAIAPIKey = ""
+                        Task {
+                            await settings.saveAPIKey(openAIAPIKey, provider: .openAI)
+                            openAIAPIKey = ""
+                        }
                     },
-                    clear: { settings.clearAPIKey(provider: .openAI) }
+                    clear: { Task { await settings.clearAPIKey(provider: .openAI) } }
                 )
 
                 credentialRow(
@@ -125,10 +129,12 @@ struct SettingsView: View {
                     configured: settings.hasDeepSeekAPIKey,
                     value: $deepSeekAPIKey,
                     save: {
-                        settings.saveAPIKey(deepSeekAPIKey, provider: .deepSeek)
-                        deepSeekAPIKey = ""
+                        Task {
+                            await settings.saveAPIKey(deepSeekAPIKey, provider: .deepSeek)
+                            deepSeekAPIKey = ""
+                        }
                     },
-                    clear: { settings.clearAPIKey(provider: .deepSeek) }
+                    clear: { Task { await settings.clearAPIKey(provider: .deepSeek) } }
                 )
             }
 
@@ -147,16 +153,23 @@ struct SettingsView: View {
                     configured: settings.hasBailianASRAPIKey,
                     value: $bailianAPIKey,
                     save: {
-                        settings.saveTranscriptionAPIKey(bailianAPIKey, provider: .bailianASR)
-                        bailianAPIKey = ""
+                        Task {
+                            await settings.saveTranscriptionAPIKey(bailianAPIKey, provider: .bailianASR)
+                            bailianAPIKey = ""
+                        }
                     },
-                    clear: { settings.clearTranscriptionAPIKey(provider: .bailianASR) }
+                    clear: { Task { await settings.clearTranscriptionAPIKey(provider: .bailianASR) } }
                 )
             }
 
             if let error = settings.lastSettingsError {
                 Section("Error") {
                     Text(error).foregroundStyle(MVSTheme.danger)
+                    Button {
+                        Task { await settings.retryCredentialAccess() }
+                    } label: {
+                        Label("Retry Keychain Access", systemImage: "lock.rotation")
+                    }
                 }
             }
         }
@@ -241,6 +254,7 @@ struct SettingsView: View {
                     .disabled(!configured)
             }
         }
+        .disabled(settings.isUpdatingCredentials)
     }
 
     private func chooseDirectory(_ update: (URL) -> Void) {
@@ -264,9 +278,10 @@ struct SettingsView: View {
     }
 
     private func eraseHistory() {
+        guard !jobs.hasActiveJobs, !recorder.isBusy else { return }
         do {
-            jobs.clearHistory()
             try library.eraseAllGeneratedData(settings: settings)
+            jobs.clearHistory()
             library.refresh(settings: settings)
         } catch {
             eraseError = error.localizedDescription

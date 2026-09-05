@@ -10,6 +10,11 @@ final class RecordingController: NSObject, ObservableObject {
     @Published private(set) var targets: [CaptureTarget] = []
     @Published var selectedTargetID: CaptureTarget.ID?
     @Published private(set) var isRecording = false
+    @Published private(set) var isStarting = false
+    @Published private(set) var isStopping = false
+    @Published private(set) var recordingSource: VideoSourceKind = .zoom
+    var isBusy: Bool { isRecording || isStarting || isStopping }
+    private var recordingError: String?
     @Published private(set) var status = "Click Refresh to load recording targets"
     @Published private(set) var lastRecordingURL: URL?
     @Published var meetingSource: VideoSourceKind = .zoom {
@@ -42,6 +47,7 @@ final class RecordingController: NSObject, ObservableObject {
     }
 
     func refreshTargets() async {
+        guard !isBusy else { return }
         guard ensureScreenPermission() else {
             clearTargets()
             return
@@ -123,7 +129,10 @@ final class RecordingController: NSObject, ObservableObject {
     }
 
     func startRecording(settings: SettingsStore) async {
-        guard !isRecording else { return }
+        guard !isBusy else { return }
+        isStarting = true
+        defer { isStarting = false }
+        recordingSource = meetingSource
         guard #available(macOS 15.0, *) else {
             status = MVSError.recordingUnavailable.localizedDescription
             return
@@ -132,10 +141,6 @@ final class RecordingController: NSObject, ObservableObject {
             guard ensureScreenPermission() else { return }
             if includeMicrophone {
                 guard await ensureMicrophonePermission() else { return }
-            }
-            if selectedTargetID == nil {
-                status = "Loading capture targets"
-                await refreshTargets()
             }
             guard let targetID = selectedTargetID else {
                 throw MVSError.noCaptureTarget
@@ -151,27 +156,43 @@ final class RecordingController: NSObject, ObservableObject {
             recordingConfiguration.videoCodecType = .h264
             let output = SCRecordingOutput(configuration: recordingConfiguration, delegate: self)
             try stream.addRecordingOutput(output)
-            try await stream.startCapture()
-
             activeStream = stream
             recordingOutput = output
             recordingFinished = false
+            recordingError = nil
+            try await stream.startCapture()
+            if let recordingError { throw MVSError.processFailed(recordingError) }
             lastRecordingURL = outputURL
             isRecording = true
             status = "Recording"
         } catch {
+            if let stream = activeStream { try? await stream.stopCapture() }
+            activeStream = nil
+            recordingOutput = nil
+            isRecording = false
             status = error.localizedDescription
         }
     }
 
     func stopRecording() async -> URL? {
-        guard isRecording else { return nil }
+        guard isRecording, !isStopping else { return nil }
+        isStopping = true
+        defer {
+            activeStream = nil
+            recordingOutput = nil
+            isRecording = false
+            isStopping = false
+        }
         do {
             if let stream = activeStream {
                 try await stream.stopCapture()
             }
             await waitForRecordingOutputToFinish()
-            let url = lastRecordingURL
+            if let recordingError { throw MVSError.processFailed(recordingError) }
+            guard let url = lastRecordingURL,
+                  (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map({ $0 > 0 }) == true else {
+                throw MVSError.processFailed("No finalized recording file was produced.")
+            }
             activeStream = nil
             recordingOutput = nil
             isRecording = false
@@ -180,7 +201,7 @@ final class RecordingController: NSObject, ObservableObject {
         } catch {
             status = error.localizedDescription
             isRecording = false
-            return lastRecordingURL
+            return nil
         }
     }
 
@@ -189,11 +210,12 @@ final class RecordingController: NSObject, ObservableObject {
         status = "Finalizing recording"
         await withCheckedContinuation { continuation in
             finishContinuation = continuation
+            let expectedOutput = recordingOutput
             Task {
-                try? await Task.sleep(for: .seconds(8))
+                try? await Task.sleep(for: .seconds(30))
                 await MainActor.run {
-                    if !recordingFinished {
-                        status = "Recording finalization timed out; trying saved file"
+                    if recordingOutput === expectedOutput, !recordingFinished {
+                        recordingError = "Recording finalization timed out. The file was retained for recovery but will not be analyzed."
                         markRecordingOutputFinished()
                     }
                 }
@@ -313,8 +335,8 @@ final class RecordingController: NSObject, ObservableObject {
             configuration.width = display.width
             configuration.height = display.height
         } else if let window = windowMap[targetID] {
-            configuration.width = max(Int(window.frame.width), 1280)
-            configuration.height = max(Int(window.frame.height), 720)
+            configuration.width = max(2, Int(window.frame.width) / 2 * 2)
+            configuration.height = max(2, Int(window.frame.height) / 2 * 2)
         } else {
             throw MVSError.noCaptureTarget
         }
@@ -325,20 +347,29 @@ final class RecordingController: NSObject, ObservableObject {
 extension RecordingController: SCRecordingOutputDelegate {
     nonisolated func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
         Task { @MainActor in
+            guard self.recordingOutput === recordingOutput else { return }
             status = "Recording"
         }
     }
 
     nonisolated func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
         Task { @MainActor in
+            guard self.recordingOutput === recordingOutput else { return }
+            recordingError = error.localizedDescription
             status = error.localizedDescription
-            isRecording = false
             markRecordingOutputFinished()
+            if !isStopping {
+                if let activeStream { try? await activeStream.stopCapture() }
+                isRecording = false
+                activeStream = nil
+                self.recordingOutput = nil
+            }
         }
     }
 
     nonisolated func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
         Task { @MainActor in
+            guard self.recordingOutput === recordingOutput else { return }
             status = "Recording finished"
             markRecordingOutputFinished()
         }
@@ -348,8 +379,13 @@ extension RecordingController: SCRecordingOutputDelegate {
 extension RecordingController: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor in
+            guard self.activeStream === stream else { return }
+            recordingError = error.localizedDescription
             status = error.localizedDescription
+            markRecordingOutputFinished()
             isRecording = false
+            self.activeStream = nil
+            recordingOutput = nil
         }
     }
 }

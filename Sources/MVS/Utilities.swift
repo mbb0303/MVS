@@ -1,7 +1,18 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 enum MVSPaths {
+    static func artifactStem(_ mediaID: String) -> String {
+        let hash = SHA256.hash(data: Data(mediaID.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
+        return String(sanitizeFilename(mediaID).prefix(65)) + "-" + hash
+    }
+
+    static func keyword(_ value: String) -> String {
+        String(value.unicodeScalars.map {
+            CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-" ? Character($0) : "-"
+        }).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
     static let legacyObsidianVaultPath = "/Users/mbb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Application/MVS"
 
     static var defaultLibraryPath: String {
@@ -70,185 +81,5 @@ enum MVSPaths {
         let parent = directory.standardizedFileURL.resolvingSymlinksInPath().pathComponents
         guard child.count >= parent.count else { return false }
         return child.prefix(parent.count).elementsEqual(parent)
-    }
-}
-
-struct ShellResult {
-    let stdout: String
-    let stderr: String
-}
-
-private final class LockedData: @unchecked Sendable {
-    private let lock = NSLock()
-    private var data = Data()
-
-    func append(_ chunk: Data) {
-        lock.lock()
-        data.append(chunk)
-        lock.unlock()
-    }
-
-    func string() -> String {
-        lock.lock()
-        let value = String(data: data, encoding: .utf8) ?? ""
-        lock.unlock()
-        return value
-    }
-}
-
-private final class LineBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pending = ""
-
-    func append(_ text: String) -> [String] {
-        lock.lock()
-        pending += text
-        let pieces = pending.components(separatedBy: .newlines)
-        pending = pieces.last ?? ""
-        let complete = Array(pieces.dropLast()).filter { !$0.isEmpty }
-        lock.unlock()
-        return complete
-    }
-}
-
-private final class RunningProcess: @unchecked Sendable {
-    private let lock = NSLock()
-    private var process: Process?
-    private var cancelled = false
-
-    func attach(_ process: Process) {
-        lock.lock()
-        self.process = process
-        let shouldCancel = cancelled
-        lock.unlock()
-        if shouldCancel {
-            terminate(process)
-        }
-    }
-
-    func cancel() {
-        lock.lock()
-        cancelled = true
-        let process = process
-        lock.unlock()
-        if let process {
-            terminate(process)
-        }
-    }
-
-    func wasCancelled() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cancelled
-    }
-
-    private func terminate(_ process: Process) {
-        guard process.isRunning else { return }
-        let pid = process.processIdentifier
-        if pid > 0 {
-            kill(-pid, SIGTERM)
-            kill(pid, SIGTERM)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                if kill(pid, 0) == 0 {
-                    kill(-pid, SIGKILL)
-                    kill(pid, SIGKILL)
-                }
-            }
-        }
-    }
-}
-
-enum ShellRunner {
-    static func run(_ executable: String, _ arguments: [String]) async throws -> ShellResult {
-        try await runWithEnvironment(executable, arguments, environment: [:]) { _ in }
-    }
-
-    static func runStreaming(
-        _ executable: String,
-        _ arguments: [String],
-        onOutputLine: @escaping @Sendable (String) -> Void
-    ) async throws -> ShellResult {
-        try await runWithEnvironment(executable, arguments, environment: [:], onOutputLine: onOutputLine)
-    }
-
-    static func runWithEnvironment(
-        _ executable: String,
-        _ arguments: [String],
-        environment: [String: String],
-        standardInput: Data? = nil,
-        onOutputLine: @escaping @Sendable (String) -> Void
-    ) async throws -> ShellResult {
-        let runningProcess = RunningProcess()
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            return try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-            if !environment.isEmpty {
-                process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
-            }
-
-            let stdout = Pipe()
-            let stderr = Pipe()
-            let stdoutData = LockedData()
-            let stderrData = LockedData()
-            let stdoutLines = LineBuffer()
-            let stderrLines = LineBuffer()
-
-            stdout.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                stdoutData.append(data)
-                guard let text = String(data: data, encoding: .utf8) else { return }
-                stdoutLines.append(text).forEach(onOutputLine)
-            }
-
-            stderr.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                stderrData.append(data)
-                guard let text = String(data: data, encoding: .utf8) else { return }
-                stderrLines.append(text).forEach(onOutputLine)
-            }
-
-            process.standardOutput = stdout
-            process.standardError = stderr
-            let stdin = Pipe()
-            process.standardInput = stdin
-
-            process.terminationHandler = { process in
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                stdoutData.append(stdout.fileHandleForReading.readDataToEndOfFile())
-                stderrData.append(stderr.fileHandleForReading.readDataToEndOfFile())
-                let result = ShellResult(stdout: stdoutData.string(), stderr: stderrData.string())
-                if runningProcess.wasCancelled() {
-                    continuation.resume(throwing: CancellationError())
-                } else if process.terminationStatus == 0 {
-                    continuation.resume(returning: result)
-                } else {
-                    let message = result.stderr.isEmpty ? result.stdout : result.stderr
-                    continuation.resume(throwing: MVSError.processFailed(message.trimmingCharacters(in: .whitespacesAndNewlines)))
-                }
-            }
-
-            do {
-                try process.run()
-                setpgid(process.processIdentifier, process.processIdentifier)
-                runningProcess.attach(process)
-                if let standardInput {
-                    stdin.fileHandleForWriting.write(standardInput)
-                }
-                try? stdin.fileHandleForWriting.close()
-            } catch {
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                continuation.resume(throwing: error)
-            }
-            }
-        } onCancel: {
-            runningProcess.cancel()
-        }
     }
 }

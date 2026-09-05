@@ -1,11 +1,12 @@
 import Foundation
+import AVFoundation
 
 @MainActor
 final class OpenAIClient {
     private let apiKey: String
     private let session: URLSession
 
-    init(apiKey: String, session: URLSession = .shared) {
+    init(apiKey: String, session: URLSession = APISession.shared) {
         self.apiKey = apiKey
         self.session = session
     }
@@ -13,11 +14,22 @@ final class OpenAIClient {
     func transcribe(chunks: [URL], diarize: Bool) async throws -> TranscriptResult {
         var fullText: [String] = []
         var segments: [TranscriptSegment] = []
+        var timeOffset = 0.0
 
         for (index, chunk) in chunks.enumerated() {
+            try Task.checkCancellation()
             let result = try await transcribeSingleFile(chunk, diarize: diarize, chunkIndex: index)
             fullText.append(result.text)
-            segments.append(contentsOf: result.segments)
+            segments.append(contentsOf: result.segments.map {
+                TranscriptSegment(id: $0.id, start: $0.start.map { $0 + timeOffset },
+                    end: $0.end.map { $0 + timeOffset },
+                    speaker: $0.speaker.map { "chunk-\(index + 1):\($0)" }, text: $0.text)
+            })
+            let duration = try await AVURLAsset(url: chunk).load(.duration).seconds
+            guard duration.isFinite, duration > 0 else {
+                throw MVSError.processFailed("Could not determine audio chunk duration.")
+            }
+            timeOffset += duration
         }
 
         return TranscriptResult(text: fullText.joined(separator: "\n\n"), segments: segments)
@@ -27,6 +39,7 @@ final class OpenAIClient {
         let boundary = "Boundary-\(UUID().uuidString)"
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/transcriptions")!)
         request.httpMethod = "POST"
+        request.timeoutInterval = 600
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
@@ -35,6 +48,9 @@ final class OpenAIClient {
         let responseFormat = diarize ? "diarized_json" : "json"
         body.appendMultipartField(name: "model", value: model, boundary: boundary)
         body.appendMultipartField(name: "response_format", value: responseFormat, boundary: boundary)
+        if diarize {
+            body.appendMultipartField(name: "chunking_strategy", value: "auto", boundary: boundary)
+        }
         if !diarize {
             body.appendMultipartField(
                 name: "prompt",
@@ -42,7 +58,7 @@ final class OpenAIClient {
                 boundary: boundary
             )
         }
-        body.appendMultipartFile(name: "file", fileURL: audioURL, mimeType: mimeType(for: audioURL), boundary: boundary)
+        try body.appendMultipartFile(name: "file", fileURL: audioURL, mimeType: mimeType(for: audioURL), boundary: boundary)
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = body
 
@@ -72,7 +88,7 @@ final class OpenAIClient {
         }
         guard (200..<300).contains(http.statusCode) else {
             let message = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
-            throw MVSError.openAIResponse(message)
+            throw MVSError.openAIResponse(DiagnosticRedactor.redact(message))
         }
         return data
     }
@@ -94,13 +110,11 @@ private extension Data {
         append("\(value)\r\n".data(using: .utf8)!)
     }
 
-    mutating func appendMultipartFile(name: String, fileURL: URL, mimeType: String, boundary: String) {
+    mutating func appendMultipartFile(name: String, fileURL: URL, mimeType: String, boundary: String) throws {
         append("--\(boundary)\r\n".data(using: .utf8)!)
         append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(fileURL.lastPathComponent)\"\r\n".data(using: .utf8)!)
         append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
-        if let fileData = try? Data(contentsOf: fileURL) {
-            append(fileData)
-        }
+        append(try Data(contentsOf: fileURL))
         append("\r\n".data(using: .utf8)!)
     }
 }

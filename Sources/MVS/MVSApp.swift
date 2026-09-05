@@ -28,6 +28,7 @@ struct MVSApp: App {
                 .environmentObject(settings)
                 .environmentObject(jobStore)
                 .environmentObject(libraryStore)
+                .environmentObject(recorder)
                 .frame(width: 780, height: 620)
         }
     }
@@ -36,7 +37,7 @@ struct MVSApp: App {
 enum AppIcon {
     @MainActor
     static func installRuntimeIcon() {
-        guard let url = Bundle.module.url(forResource: "AppIcon", withExtension: "png"),
+        guard let url = RuntimePaths.resourceBundle.url(forResource: "AppIcon", withExtension: "png"),
               let image = NSImage(contentsOf: url) else {
             return
         }

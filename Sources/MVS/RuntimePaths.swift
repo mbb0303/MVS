@@ -1,6 +1,14 @@
 import Foundation
 
 enum RuntimePaths {
+    static var resourceBundle: Bundle {
+        if isPackagedApp {
+            if let url = Bundle.main.resourceURL?.appendingPathComponent("MVS_MVS.bundle"),
+               let bundle = Bundle(url: url) { return bundle }
+            return Bundle.main
+        }
+        return Bundle.module
+    }
     private static var isPackagedApp: Bool {
         Bundle.main.bundleURL.pathExtension.lowercased() == "app"
     }
@@ -42,7 +50,20 @@ enum RuntimePaths {
             .first { FileManager.default.fileExists(atPath: $0) }
     }
 
-    static func pythonExecutable() -> String {
+    static func pythonExecutable() throws -> String {
+        if let versionURL = roots.map({ $0.appendingPathComponent(".tools/python-version") })
+            .first(where: { FileManager.default.fileExists(atPath: $0.path) }),
+           let raw = try? String(contentsOf: versionURL, encoding: .utf8) {
+            let version = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard version.range(of: #"^3\.[0-9]+$"#, options: .regularExpression) != nil else {
+                throw MVSError.processFailed("Invalid bundled Python version.")
+            }
+            let candidates = ["/opt/homebrew/bin/python\(version)", "/opt/homebrew/opt/python@\(version)/bin/python\(version)", "/usr/local/bin/python\(version)"]
+            guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+                throw MVSError.processFailed("MVS requires Python \(version). Install it with: brew install python@\(version)")
+            }
+            return python
+        }
         var candidates: [String?] = []
         if !isPackagedApp {
             candidates.append(ProcessInfo.processInfo.environment["MVS_PYTHON"])

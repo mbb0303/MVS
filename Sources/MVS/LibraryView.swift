@@ -32,6 +32,7 @@ struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var jobs: JobStore
+    @EnvironmentObject private var recorder: RecordingController
 
     @State private var selection: LibrarySelection?
     @State private var filter: LibraryFilter = .all
@@ -229,6 +230,7 @@ struct LibraryView: View {
             if let item = library.finishedJobs.first(where: { $0.id == id }) {
                 LibraryDetailView(
                     item: item,
+                    canManage: !jobs.hasActiveJobs && !recorder.isBusy,
                     rename: { renameItem = item },
                     move: { moveItem = item },
                     delete: { deleteItem = item }
@@ -240,6 +242,7 @@ struct LibraryView: View {
             if let item = library.pendingVideos.first(where: { $0.id == id }) {
                 PendingLibraryDetail(
                     item: item,
+                    canManage: !jobs.hasActiveJobs && !recorder.isBusy,
                     summarize: {
                         pipeline.summarizeArchivedVideo(
                             item.videoURL,
@@ -328,8 +331,8 @@ struct LibraryView: View {
     private func selectFirstIfNeeded() {
         if let selection {
             switch selection {
-            case .finished(let id) where library.finishedJobs.contains(where: { $0.id == id }): return
-            case .pending(let id) where library.pendingVideos.contains(where: { $0.id == id }): return
+            case .finished(let id) where filteredFinished.contains(where: { $0.id == id }): return
+            case .pending(let id) where filteredPending.contains(where: { $0.id == id }): return
             default: break
             }
         }
@@ -351,6 +354,7 @@ struct LibraryView: View {
                 settings: settings
             )
             folderFilter = "\(sourceDirectory)/\(path)"
+            filter = sourceDirectory == "URL" ? .url : (sourceDirectory == "Local" ? .local : .meeting)
         } catch {
             operationError = error.localizedDescription
         }
@@ -372,6 +376,7 @@ struct LibraryView: View {
         do {
             let mapping = try library.moveProject(item, toFolderPath: path, settings: settings)
             jobs.relocateArtifacts(mapping, mediaID: item.mediaID)
+            folderFilter = path.map { "\(item.source.libraryDirectoryName)/\($0)" } ?? "__root__"
             selection = library.finishedJobs
                 .first(where: { $0.mediaID == item.mediaID })
                 .map { .finished($0.id) }
@@ -459,6 +464,7 @@ private struct PendingLibraryRow: View {
 
 private struct LibraryDetailView: View {
     let item: FinishedJob
+    let canManage: Bool
     let rename: () -> Void
     let move: () -> Void
     let delete: () -> Void
@@ -486,9 +492,11 @@ private struct LibraryDetailView: View {
                 Button(action: rename) { Image(systemName: "pencil") }
                     .buttonStyle(MVSSecondaryButtonStyle())
                     .help("Rename project")
+                    .disabled(!canManage)
                 Button(action: move) { Image(systemName: "folder") }
                     .buttonStyle(MVSSecondaryButtonStyle())
                     .help("Move to folder")
+                    .disabled(!canManage)
                 if let video = item.videoURL {
                     Button {
                         NSWorkspace.shared.open(video)
@@ -502,6 +510,7 @@ private struct LibraryDetailView: View {
                     .buttonStyle(MVSSecondaryButtonStyle())
                     .foregroundStyle(MVSTheme.danger)
                     .help("Delete project")
+                    .disabled(!canManage)
             }
             .padding(22)
             .background(MVSTheme.canvas)
@@ -559,6 +568,7 @@ private struct LibraryDetailView: View {
 
 private struct PendingLibraryDetail: View {
     let item: PendingVideoSummary
+    let canManage: Bool
     let summarize: () -> Void
     let delete: () -> Void
 
@@ -578,6 +588,7 @@ private struct PendingLibraryDetail: View {
                     Label("Summarize", systemImage: "sparkles")
                 }
                 .buttonStyle(MVSPrimaryButtonStyle())
+                .disabled(!canManage)
                 Button {
                     NSWorkspace.shared.open(item.videoURL)
                 } label: {
@@ -589,6 +600,7 @@ private struct PendingLibraryDetail: View {
                 }
                 .buttonStyle(MVSSecondaryButtonStyle())
                 .foregroundStyle(MVSTheme.danger)
+                .disabled(!canManage)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

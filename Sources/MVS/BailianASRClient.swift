@@ -16,10 +16,12 @@ final class BailianASRClient {
         }
 
         let result = try await ShellRunner.runWithEnvironment(
-            RuntimePaths.pythonExecutable(),
-            [script.path, "--model", model] + chunks.map(\.path),
+            try RuntimePaths.pythonExecutable(),
+            ["-s", "-P", "-B", script.path, "--model", model] + chunks.map(\.path),
             environment: [
-                "PYTHONPATH": dashscopePythonPath()
+                "PYTHONPATH": dashscopePythonPath(),
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONDONTWRITEBYTECODE": "1"
             ],
             standardInput: Data((apiKey + "\n").utf8)
         ) { line in

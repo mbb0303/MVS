@@ -20,31 +20,60 @@ struct MarkdownContentView: View {
 
     var body: some View {
         ScrollView {
-            Text(renderedMarkdown)
-                .font(.system(size: 14))
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if let marker = block.marker { Text(marker).foregroundStyle(MVSTheme.muted) }
+                        Text(block.text)
+                            .font(block.font)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.leading, block.indent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
                 .foregroundStyle(MVSTheme.ink)
                 .frame(maxWidth: 760, alignment: .leading)
-                .textSelection(.enabled)
                 .padding(28)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(MVSTheme.surface)
+        .environment(\.openURL, OpenURLAction { url in
+            ["http", "https"].contains(url.scheme?.lowercased() ?? "") ? .systemAction : .discarded
+        })
     }
 
-    private var renderedMarkdown: AttributedString {
-        (try? AttributedString(
-            markdown: contentWithoutFrontMatter,
+    private var blocks: [MarkdownBlock] {
+        let source = NoteFrontMatter(content).body
+        guard let parsed = try? AttributedString(
+            markdown: source,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        )) ?? AttributedString(contentWithoutFrontMatter)
-    }
-
-    private var contentWithoutFrontMatter: String {
-        guard content.hasPrefix("---\n"),
-              let closing = content.range(of: "\n---\n", range: content.index(content.startIndex, offsetBy: 4)..<content.endIndex) else {
-            return content
+        ) else { return [MarkdownBlock(text: AttributedString(source))] }
+        return parsed.runs[\.presentationIntent].map { intent, range in
+            var block = MarkdownBlock(text: AttributedString(parsed[range]))
+            for component in intent?.components ?? [] {
+                switch component.kind {
+                case .header(let level):
+                    block.font = .system(size: level == 1 ? 22 : (level == 2 ? 18 : 15), weight: .semibold)
+                case .codeBlock:
+                    block.font = .system(size: 12, design: .monospaced)
+                case .listItem(let ordinal):
+                    block.marker = intent?.components.contains(where: { $0.kind == .orderedList }) == true ? "\(ordinal)." : "•"
+                    block.indent = 8
+                default: break
+                }
+            }
+            return block
         }
-        return String(content[closing.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
+}
+
+private struct MarkdownBlock {
+    var text: AttributedString
+    var font: Font = .system(size: 14)
+    var marker: String?
+    var indent: CGFloat = 0
 }
 
 struct MarkdownReaderView: View {

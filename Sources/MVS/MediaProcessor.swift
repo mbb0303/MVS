@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 struct PreparedMedia {
     let title: String
@@ -34,10 +35,10 @@ final class MediaProcessor {
         let outputTemplate = tempDir.appendingPathComponent("%(title).200B-%(id)s.%(ext)s").path
 
         progress?("Reading video metadata")
-        let metadata = try await readURLMetadata(rawURL, ytDLP: ytDLP, settings: settings)
+        let (metadata, subtitleLanguage) = try await readURLMetadata(rawURL, ytDLP: ytDLP, settings: settings)
 
         var subtitleTranscript: TranscriptResult?
-        if options.preferPlatformSubtitles && !options.forceASR {
+        if options.preferPlatformSubtitles && !options.forceASR, let subtitleLanguage {
             do {
                 progress?("Checking platform subtitles")
                 _ = try await ShellRunner.runStreaming(ytDLP, ytdlpBaseArguments(settings: settings) + [
@@ -45,7 +46,7 @@ final class MediaProcessor {
                     "--ignore-errors",
                     "--write-subs",
                     "--write-auto-subs",
-                    "--sub-langs", "zh-Hans,zh-CN,zh,zh-TW,zh-Hant,en.*",
+                    "--sub-langs", NSRegularExpression.escapedPattern(for: subtitleLanguage),
                     "--sub-format", "vtt/srt/json3",
                     "-o", outputTemplate,
                     rawURL
@@ -54,17 +55,18 @@ final class MediaProcessor {
                         progress?(message)
                     }
                 }
-                subtitleTranscript = try parseBestSubtitleTranscript(in: tempDir)
+                subtitleTranscript = try parseBestSubtitleTranscript(in: tempDir, duration: metadata.duration)
                 if subtitleTranscript != nil {
                     progress?("Platform subtitles found")
                 }
             } catch {
+                try Task.checkCancellation()
                 progress?("Subtitle probe skipped: \(error.localizedDescription)")
             }
         }
 
         if let subtitleTranscript,
-           metadata.duration.map({ Self.transcriptCoversMedia(subtitleTranscript, duration: $0) }) ?? true {
+           SubtitleParser.covers(subtitleTranscript, duration: metadata.duration) {
             let archivedVideo: URL?
             if options.keepDownloadedVideo {
                 try await downloadVideo(rawURL, ytDLP: ytDLP, outputTemplate: outputTemplate, settings: settings, progress: progress)
@@ -120,7 +122,7 @@ final class MediaProcessor {
         } catch {
             throw Self.humanizedYTDLPError(error, rawURL: rawURL)
         }
-        let audioSources = try downloadedMedia(in: tempDir, extensions: ["m4a", "webm", "opus", "mp3", "aac", "wav", "ogg"])
+        let audioSources = try downloadedMedia(in: tempDir, extensions: ["m4a", "webm", "opus", "mp3", "aac", "wav", "ogg", "mp4", "mkv"])
         guard let audioSource = audioSources.first else {
             throw MVSError.processFailed("yt-dlp did not produce an audio file.")
         }
@@ -153,11 +155,7 @@ final class MediaProcessor {
         let workDirectory = try makeTempDirectory(prefix: "mvs-audio")
         do {
             progress?("Extracting audio with ffmpeg")
-            let audio = try await extractCompressedAudio(from: archived, outputDirectory: workDirectory)
-            progress?("Checking audio size")
-            let chunks = try await splitAudioIfNeeded(audio, outputDirectory: workDirectory) { message in
-                progress?(message)
-            }
+            let chunks = try await extractAudioChunks(from: archived, outputDirectory: workDirectory)
             let duration = try? await mediaDuration(for: archived)
             let effectiveTranscript: TranscriptResult?
             let effectiveTranscriptModel: String?
@@ -208,10 +206,7 @@ final class MediaProcessor {
         let workDirectory = try makeTempDirectory(prefix: "mvs-audio")
         do {
             progress?("Extracting audio with ffmpeg")
-            let audio = try await extractCompressedAudio(from: sourceURL, outputDirectory: workDirectory)
-            let chunks = try await splitAudioIfNeeded(audio, outputDirectory: workDirectory) { message in
-                progress?(message)
-            }
+            let chunks = try await extractAudioChunks(from: sourceURL, outputDirectory: workDirectory)
             return PreparedMedia(
                 title: title,
                 mediaID: metadata.mediaID,
@@ -260,34 +255,13 @@ final class MediaProcessor {
         ) else { return }
         let cutoff = Date().addingTimeInterval(-age)
         for child in children where child.lastPathComponent.hasPrefix("mvs-url-") || child.lastPathComponent.hasPrefix("mvs-audio-") {
+            guard (try? child.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
+                  let owner = try? String(contentsOf: child.appendingPathComponent(".mvs-owner"), encoding: .utf8),
+                  let pid = Int32(owner), pid > 0 else { continue }
+            if kill(pid, 0) == 0 || errno == EPERM { continue }
             let modified = try? child.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
             if modified.map({ $0 < cutoff }) ?? false {
                 try? fileManager.removeItem(at: child)
-            }
-        }
-    }
-
-    static func cleanupLegacyIntermediateAudio(in assetRoot: URL) {
-        let fileManager = FileManager.default
-        for sourceDirectory in ["URL", "Local", "Meeting"] {
-            let directory = assetRoot.appendingPathComponent(sourceDirectory, isDirectory: true)
-            guard let children = try? fileManager.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
-            let videoStems = Set(children
-                .filter { ["mp4", "mov", "mkv", "webm"].contains($0.pathExtension.lowercased()) }
-                .map { $0.deletingPathExtension().lastPathComponent })
-            for child in children {
-                let name = child.lastPathComponent
-                if child.pathExtension.lowercased() == "wav",
-                   videoStems.contains(child.deletingPathExtension().lastPathComponent) {
-                    try? fileManager.removeItem(at: child)
-                } else if name.hasSuffix("-chunks"),
-                          videoStems.contains(String(name.dropLast("-chunks".count))) {
-                    try? fileManager.removeItem(at: child)
-                }
             }
         }
     }
@@ -339,163 +313,39 @@ final class MediaProcessor {
         settings.videoRootURL.appendingPathComponent(source.libraryDirectoryName, isDirectory: true)
     }
 
-    private func parseBestSubtitleTranscript(in directory: URL) throws -> TranscriptResult? {
-        let subtitles = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey], options: [])
-            .filter { ["vtt", "srt"].contains($0.pathExtension.lowercased()) }
-            .sorted { lhs, rhs in
-                subtitleRank(lhs.lastPathComponent) < subtitleRank(rhs.lastPathComponent)
-            }
+    private func parseBestSubtitleTranscript(in directory: URL, duration: Double?) throws -> TranscriptResult? {
+        let subtitles = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { ["vtt", "srt", "json3"].contains($0.pathExtension.lowercased()) }
+            .sorted { SubtitleParser.rank($0.lastPathComponent) < SubtitleParser.rank($1.lastPathComponent) }
         for subtitle in subtitles {
-            let result = subtitle.pathExtension.lowercased() == "srt" ? try parseSRTSubtitle(subtitle) : try parseVTTSubtitle(subtitle)
-            if !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let content = try String(contentsOf: subtitle, encoding: .utf8)
+            if let result = try? SubtitleParser.parse(content, format: subtitle.pathExtension),
+               SubtitleParser.covers(result, duration: duration) {
                 return result
             }
         }
         return nil
     }
 
-    private func subtitleRank(_ filename: String) -> Int {
-        let lower = filename.lowercased()
-        if lower.contains(".zh") { return 0 }
-        if lower.contains(".en") { return 1 }
-        return 2
-    }
-
-    private func parseVTTSubtitle(_ url: URL) throws -> TranscriptResult {
-        let content = try String(contentsOf: url, encoding: .utf8)
-        var segments: [TranscriptSegment] = []
-        var currentStart: Double?
-        var currentEnd: Double?
-        var textLines: [String] = []
-
-        func flush() {
-            let text = textLines
-                .map { cleanSubtitleText($0) }
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
-            if !text.isEmpty {
-                segments.append(TranscriptSegment(id: "subtitle-\(segments.count)", start: currentStart, end: currentEnd, speaker: nil, text: text))
-            }
-            currentStart = nil
-            currentEnd = nil
-            textLines = []
-        }
-
-        for rawLine in content.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty {
-                flush()
-                continue
-            }
-            if line == "WEBVTT" || line.hasPrefix("NOTE") || Int(line) != nil {
-                continue
-            }
-            if line.contains("-->") {
-                flush()
-                let parts = line.components(separatedBy: "-->")
-                currentStart = parseVTTTime(parts.first?.trimmingCharacters(in: .whitespacesAndNewlines))
-                let endPart = parts.dropFirst().first?.components(separatedBy: " ").first
-                currentEnd = parseVTTTime(endPart?.trimmingCharacters(in: .whitespacesAndNewlines))
-            } else {
-                textLines.append(line)
-            }
-        }
-        flush()
-
-        var deduped: [TranscriptSegment] = []
-        for segment in segments {
-            if deduped.last?.text == segment.text { continue }
-            deduped.append(segment)
-        }
-        let text = deduped.map(\.text).joined(separator: "\n")
-        return TranscriptResult(text: text, segments: deduped)
-    }
-
-    private func parseSRTSubtitle(_ url: URL) throws -> TranscriptResult {
-        let content = try String(contentsOf: url, encoding: .utf8)
-        let blocks = content.components(separatedBy: "\n\n")
-        var segments: [TranscriptSegment] = []
-        for block in blocks {
-            let lines = block.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-            guard let timeIndex = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
-            let parts = lines[timeIndex].components(separatedBy: "-->")
-            let start = parseVTTTime(parts.first?.trimmingCharacters(in: .whitespacesAndNewlines))
-            let end = parseVTTTime(parts.dropFirst().first?.trimmingCharacters(in: .whitespacesAndNewlines))
-            let text = lines.dropFirst(timeIndex + 1).map { cleanSubtitleText($0) }.filter { !$0.isEmpty }.joined(separator: " ")
-            if !text.isEmpty {
-                segments.append(TranscriptSegment(id: "subtitle-\(segments.count)", start: start, end: end, speaker: nil, text: text))
-            }
-        }
-        return TranscriptResult(text: segments.map(\.text).joined(separator: "\n"), segments: segments)
-    }
-
-    private func parseVTTTime(_ value: String?) -> Double? {
-        guard let value else { return nil }
-        let parts = value.replacingOccurrences(of: ",", with: ".").split(separator: ":").map(String.init)
-        guard let last = parts.last, let seconds = Double(last) else { return nil }
-        if parts.count == 3 {
-            return (Double(parts[0]) ?? 0) * 3600 + (Double(parts[1]) ?? 0) * 60 + seconds
-        }
-        if parts.count == 2 {
-            return (Double(parts[0]) ?? 0) * 60 + seconds
-        }
-        return seconds
-    }
-
-    private func cleanSubtitleText(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"&amp;"#, with: "&", options: .regularExpression)
-            .replacingOccurrences(of: #"&lt;"#, with: "<", options: .regularExpression)
-            .replacingOccurrences(of: #"&gt;"#, with: ">", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func extractCompressedAudio(from videoURL: URL, outputDirectory: URL) async throws -> URL {
+    func extractAudioChunks(from videoURL: URL, outputDirectory: URL, segmentSeconds: Int = 600) async throws -> [URL] {
         let ffmpeg = try executable("ffmpeg")
-        let output = outputDirectory.appendingPathComponent("audio.wav")
+        let seconds = min(600, max(1, segmentSeconds))
+        let template = outputDirectory.appendingPathComponent("chunk-%06d.wav").path
         _ = try await ShellRunner.run(ffmpeg, [
-            "-nostdin",
-            "-y",
-            "-i", videoURL.path,
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            output.path
+            "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-protocol_whitelist", "file,pipe",
+            "-format_whitelist", "mov,matroska,webm,wav,mp3,ogg,flac,aac",
+            "-i", videoURL.path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            "-f", "segment", "-segment_time", String(seconds), "-reset_timestamps", "1", template
         ])
-        return output
-    }
-
-    private func splitAudioIfNeeded(
-        _ audioURL: URL,
-        outputDirectory: URL,
-        progress: (@Sendable (String) -> Void)? = nil
-    ) async throws -> [URL] {
-        let size = try audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        if size < 24_000_000 {
-            return [audioURL]
-        }
-
-        let ffmpeg = try executable("ffmpeg")
-        let directory = outputDirectory.appendingPathComponent("chunks", isDirectory: true)
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        let template = directory.appendingPathComponent("chunk-%03d.wav").path
-        progress?("Splitting long audio for transcription")
-        _ = try await ShellRunner.run(ffmpeg, [
-            "-nostdin",
-            "-y",
-            "-i", audioURL.path,
-            "-f", "segment",
-            "-segment_time", "600",
-            "-c", "copy",
-            template
-        ])
-        let chunks = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey], options: [])
-            .filter { $0.pathExtension.lowercased() == "wav" }
+        let chunks = try fileManager.contentsOfDirectory(at: outputDirectory, includingPropertiesForKeys: [.fileSizeKey])
+            .filter { $0.lastPathComponent.hasPrefix("chunk-") && $0.pathExtension == "wav" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        if chunks.isEmpty {
-            throw MVSError.processFailed("ffmpeg did not create audio chunks.")
+        guard !chunks.isEmpty else { throw MVSError.processFailed("ffmpeg did not create audio chunks.") }
+        for chunk in chunks {
+            guard let size = try chunk.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 44, size < 25_000_000 else {
+                throw MVSError.processFailed("Invalid audio chunk size.")
+            }
         }
         return chunks
     }
@@ -504,6 +354,8 @@ final class MediaProcessor {
         let ffprobe = try executable("ffprobe")
         let result = try await ShellRunner.run(ffprobe, [
             "-v", "error",
+            "-protocol_whitelist", "file,pipe",
+            "-format_whitelist", "mov,matroska,webm,wav,mp3,ogg,flac,aac",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             url.path
@@ -526,7 +378,7 @@ final class MediaProcessor {
     }
 
     nonisolated static func downloadProgressMessage(from line: String) -> String? {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = DiagnosticRedactor.redact(line.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !trimmed.isEmpty else { return nil }
 
         if trimmed.hasPrefix("[download]") {
@@ -557,15 +409,18 @@ final class MediaProcessor {
     }
 
     nonisolated static func transcriptCoversMedia(_ transcript: TranscriptResult, duration: TimeInterval) -> Bool {
-        guard duration > 60 else { return true }
-        let latestEnd = transcript.segments.compactMap(\.end).max() ?? 0
-        guard latestEnd > 0 else { return false }
-        return latestEnd >= duration * 0.85
+        SubtitleParser.covers(transcript, duration: duration)
     }
 
     private func makeTempDirectory(prefix: String) throws -> URL {
         let url = fileManager.temporaryDirectory.appendingPathComponent("\(prefix)-\(UUID().uuidString)")
-        try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        do {
+            try String(ProcessInfo.processInfo.processIdentifier).write(to: url.appendingPathComponent(".mvs-owner"), atomically: true, encoding: .utf8)
+        } catch {
+            try? fileManager.removeItem(at: url)
+            throw error
+        }
         return url
     }
 
@@ -649,15 +504,15 @@ final class MediaProcessor {
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    private func readURLMetadata(_ rawURL: String, ytDLP: String, settings: SettingsStore) async throws -> MediaMetadataArtifact {
+    private func readURLMetadata(_ rawURL: String, ytDLP: String, settings: SettingsStore) async throws -> (MediaMetadataArtifact, String?) {
         let result = try await ShellRunner.run(ytDLP, ytdlpBaseArguments(settings: settings) + [
             "--dump-single-json",
             "--skip-download",
             rawURL
-        ])
+        ], timeout: 120)
         guard let data = result.stdout.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return MediaMetadataArtifact(mediaID: UUID().uuidString, title: "url-video", sourceURL: rawURL, platform: platformName(for: rawURL), uploader: nil, duration: nil, webpageURL: rawURL, description: nil, chapters: [], createdAt: Date())
+            throw MVSError.processFailed("yt-dlp returned invalid metadata. Retry after checking the downloader.")
         }
         let title = object["title"] as? String ?? "url-video"
         let id = object["id"] as? String ?? MVSPaths.sanitizeFilename(title)
@@ -669,8 +524,8 @@ final class MediaProcessor {
             }
             return title
         } ?? []
-        return MediaMetadataArtifact(
-            mediaID: MVSPaths.sanitizeFilename("\(title)-\(id)"),
+        let artifact = MediaMetadataArtifact(
+            mediaID: "\(platformName(for: rawURL))-\(MVSPaths.sanitizeFilename(id))",
             title: title,
             sourceURL: rawURL,
             platform: platformName(for: rawURL),
@@ -681,11 +536,22 @@ final class MediaProcessor {
             chapters: chapters,
             createdAt: Date()
         )
+        let manual = object["subtitles"] as? [String: Any] ?? [:]
+        let automatic = object["automatic_captions"] as? [String: Any] ?? [:]
+        let languages = Set(manual.keys).union(automatic.keys).filter { $0 != "live_chat" }
+        let language = languages.sorted {
+            let left = SubtitleParser.rank($0)
+            let right = SubtitleParser.rank($1)
+            if left != right { return left < right }
+            if (manual[$0] != nil) != (manual[$1] != nil) { return manual[$0] != nil }
+            return $0 < $1
+        }.first
+        return (artifact, language)
     }
 
     private func platformName(for url: String) -> String {
-        let lower = url.lowercased()
-        if lower.contains("youtube.com") || lower.contains("youtu.be") { return "youtube" }
+        let lower = URL(string: url)?.host?.lowercased() ?? ""
+        if lower == "youtube.com" || lower.hasSuffix(".youtube.com") || lower == "youtu.be" { return "youtube" }
         if lower.contains("bilibili.com") || lower.contains("b23.tv") { return "bilibili" }
         if lower.contains("xiaoyuzhoufm.com") { return "xiaoyuzhou" }
         if lower.contains("podcasts.apple.com") { return "apple-podcast" }

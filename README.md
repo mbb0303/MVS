@@ -23,6 +23,11 @@ The current target is Apple Silicon macOS.
 - Delete job history independently, or delete a job together with its known project files.
 - Package as a macOS `.app` and `.dmg`.
 
+Version 0.4.1 includes a security and reliability audit, summary-stage recovery,
+bounded/cancellable subprocesses, safer Library operations, corrected subtitle
+timestamps, and non-blocking Keychain loading. See [the audit report](docs/AUDIT_2026-09-05.md)
+for findings, verification, and remaining limitations.
+
 ## Default Storage
 
 MVS does not store generated files inside `/Applications/MVS.app`.
@@ -46,6 +51,7 @@ Library/
     Meeting/
   .mvs/
     jobs.sqlite
+    checkpoints/
 ```
 
 Each completed job may generate:
@@ -67,7 +73,7 @@ The library path can be changed in Settings.
 - Apple Silicon Mac recommended
 - Xcode command line tools / Swift 6 toolchain
 - Homebrew
-- Python 3
+- Python 3.14 (the bundled native wheels target this minor version)
 - `ffmpeg`
 - Deno (used by the bundled `yt-dlp-ejs` YouTube challenge solver)
 - `yt-dlp`
@@ -130,7 +136,7 @@ The release script signs all nested native modules, signs the app and DMG with a
 
 ## API Configuration
 
-Open **API Settings** in the app.
+Open **Settings > AI** in the app.
 
 MVS stores API keys in macOS Keychain, not in source files or JSON config.
 
@@ -174,4 +180,6 @@ Microphone permission is independent from system audio capture. Zoom and Tencent
 - URL videos default to not keeping downloaded video after the note is generated, unless `Keep downloaded video` is enabled.
 - When complete platform subtitles are available and video retention is disabled, MVS skips video and audio download entirely. Otherwise it downloads audio-only for ASR unless the user explicitly keeps the video.
 - Cancel terminates active yt-dlp, ffmpeg, Python, and network work. Task audio is stored in a temporary workspace and removed on success, failure, or cancellation.
+- A completed transcript is checkpointed before summary. Summary-stage retries reuse it; mid-ASR chunk recovery is not yet implemented.
+- Credentials load in the background, so waiting for Keychain authorization does not block the Library UI.
 - Meeting recording is manual: choose a capture target, start recording, stop recording, then MVS processes the saved video.

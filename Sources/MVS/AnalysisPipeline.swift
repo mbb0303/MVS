@@ -8,6 +8,7 @@ final class AnalysisPipeline {
     func analyzeURL(_ rawURL: String, options: URLAnalysisOptions = .default, settings: SettingsStore, jobs: JobStore, library: LibraryStore? = nil) {
         var job = AnalysisJob(source: .url, title: "URL Video")
         job.sourceURL = rawURL
+        job.urlOptions = options
         jobs.add(job)
         let task = Task {
             defer { jobs.detachTask(for: job.id) }
@@ -22,6 +23,7 @@ final class AnalysisPipeline {
                 let prepared = try await mediaProcessor.prepareURLVideo(rawURL, options: options, settings: settings) { message in
                     Task { @MainActor in
                         jobs.update(jobID) {
+                            guard $0.status == .running else { return }
                             if message.localizedCaseInsensitiveContains("metadata") {
                                 $0.stage = .metadata
                             } else if message.localizedCaseInsensitiveContains("subtitle") {
@@ -62,7 +64,8 @@ final class AnalysisPipeline {
 
     func analyzeLocalFile(_ fileURL: URL, settings: SettingsStore, jobs: JobStore, library: LibraryStore? = nil) {
         let title = fileURL.deletingPathExtension().lastPathComponent
-        let job = AnalysisJob(source: .local, title: title)
+        var job = AnalysisJob(source: .local, title: title)
+        job.originalFileURL = fileURL
         jobs.add(job)
         let task = Task {
             defer { jobs.detachTask(for: job.id) }
@@ -77,6 +80,7 @@ final class AnalysisPipeline {
                 let prepared = try await mediaProcessor.prepareExistingVideo(fileURL, source: .local, title: title, settings: settings) { message in
                     Task { @MainActor in
                         jobs.update(jobID) {
+                            guard $0.status == .running else { return }
                             $0.stage = message.localizedCaseInsensitiveContains("audio") ? .audioExtraction : .archive
                             $0.progressValue = max($0.progressValue, 0.15)
                             $0.progress = message
@@ -109,6 +113,7 @@ final class AnalysisPipeline {
                 let prepared = try await mediaProcessor.prepareExistingVideo(fileURL, source: source, title: title, settings: settings, moveInsteadOfCopy: false) { message in
                     Task { @MainActor in
                         jobs.update(jobID) {
+                            guard $0.status == .running else { return }
                             $0.stage = message.localizedCaseInsensitiveContains("audio") ? .audioExtraction : .archive
                             $0.progressValue = max($0.progressValue, 0.15)
                             $0.progress = message
@@ -154,6 +159,7 @@ final class AnalysisPipeline {
                 let prepared = try await mediaProcessor.prepareExistingVideo(fileURL, source: source, title: title, settings: settings, moveInsteadOfCopy: false) { message in
                     Task { @MainActor in
                         jobs.update(jobID) {
+                            guard $0.status == .running else { return }
                             $0.stage = message.localizedCaseInsensitiveContains("audio") ? .audioExtraction : .archive
                             $0.progressValue = max($0.progressValue, 0.15)
                             $0.progress = message
@@ -214,17 +220,18 @@ final class AnalysisPipeline {
         } else {
             switch settings.transcriptionProvider {
             case .openAI:
-                let openAIKey = try settings.loadTranscriptionAPIKey(provider: .openAI)
+                let openAIKey = try await settings.loadTranscriptionAPIKey(provider: .openAI)
                 let transcriptionClient = OpenAIClient(apiKey: openAIKey)
                 rawTranscript = try await transcriptionClient.transcribe(chunks: prepared.audioChunks, diarize: diarize)
                 transcriptModel = diarize ? "gpt-4o-transcribe-diarize" : "gpt-4o-transcribe"
             case .bailianASR:
-                let bailianKey = try settings.loadTranscriptionAPIKey(provider: .bailianASR)
+                let bailianKey = try await settings.loadTranscriptionAPIKey(provider: .bailianASR)
                 let transcriptionClient = BailianASRClient(apiKey: bailianKey, model: settings.transcriptionModel)
                 let jobID = jobID
                 rawTranscript = try await transcriptionClient.transcribe(chunks: prepared.audioChunks) { message in
                     Task { @MainActor in
                         jobs.update(jobID) {
+                            guard $0.status == .running else { return }
                             $0.stage = .transcription
                             $0.progressValue = max($0.progressValue, 0.35)
                             $0.progress = message
@@ -235,6 +242,10 @@ final class AnalysisPipeline {
             }
         }
         let transcript = rawTranscript.convertedTraditionalChineseToSimplified()
+        try AnalysisCheckpoint(jobID: jobID, source: source, title: title, metadata: prepared.metadata,
+            videoURL: prepared.archivedVideoURL, duration: prepared.duration, transcript: transcript,
+            transcriptModel: transcriptModel, sourceURL: sourceURL, keepVideo: keepLocalVideoInNote)
+            .save(vault: settings.vaultURL)
 
         try Task.checkCancellation()
         jobs.update(jobID) {
@@ -242,7 +253,7 @@ final class AnalysisPipeline {
             $0.progressValue = 0.7
             $0.progress = "Summarizing transcript"
         }
-        let summaryKey = try settings.loadAPIKey(provider: settings.summaryProvider)
+        let summaryKey = try await settings.loadAPIKey(provider: settings.summaryProvider)
         let summaryClient = SummaryClient(apiKey: summaryKey)
         let summary = try await summaryClient.summarize(transcript: transcript, title: title, source: source, settings: settings)
 
@@ -281,11 +292,65 @@ final class AnalysisPipeline {
             $0.progress = "Done"
             $0.noteURL = written.noteURL
             $0.artifacts = written.artifacts
+            $0.canRetry = false
             if removeURLDownloadAfterNote {
                 $0.videoURL = nil
             }
         }
+        let checkpoint = AnalysisCheckpoint.url(jobID: jobID, vault: settings.vaultURL)
+        if MVSPaths.isURL(checkpoint, inside: settings.vaultURL) {
+            try? FileManager.default.removeItem(at: checkpoint)
+        }
         library?.refresh(settings: settings)
+    }
+
+    func retry(_ job: AnalysisJob, settings: SettingsStore, jobs: JobStore, library: LibraryStore) {
+        guard !jobs.isTaskRunning(job.id) else { return }
+        do {
+            if let checkpoint = try AnalysisCheckpoint.load(jobID: job.id, vault: settings.vaultURL) {
+                if let video = checkpoint.videoURL, !MVSPaths.isURL(video, inside: settings.videoRootURL) {
+                    throw MVSError.processFailed("Checkpoint media is outside the configured library.")
+                }
+                jobs.update(job.id) {
+                    $0.status = .running
+                    $0.stage = .summarization
+                    $0.canRetry = false
+                    $0.errorMessage = nil
+                    $0.progress = "Resuming from saved transcript"
+                }
+                let task = Task {
+                    defer { jobs.detachTask(for: job.id) }
+                    do {
+                        let prepared = PreparedMedia(title: checkpoint.title, mediaID: checkpoint.metadata.mediaID,
+                            archivedVideoURL: checkpoint.videoURL, audioChunks: [], duration: checkpoint.duration,
+                            transcript: checkpoint.transcript, transcriptModel: checkpoint.transcriptModel,
+                            metadata: checkpoint.metadata, workingDirectoryURL: nil)
+                        try await finishAnalysis(jobID: job.id, source: checkpoint.source, title: checkpoint.title,
+                            prepared: prepared, settings: settings, jobs: jobs, library: library, diarize: false,
+                            sourceURL: checkpoint.sourceURL, keepLocalVideoInNote: checkpoint.keepVideo,
+                            removeURLDownloadAfterNote: checkpoint.source == .url && !checkpoint.keepVideo)
+                    } catch {
+                        Task.isCancelled ? cancelled(job.id, jobs: jobs) : fail(job.id, error: error, jobs: jobs)
+                    }
+                }
+                jobs.attach(task, to: job.id)
+                return
+            }
+            if job.source == .url, let url = job.sourceURL {
+                jobs.remove(job.id)
+                analyzeURL(url, options: job.urlOptions ?? .default, settings: settings, jobs: jobs, library: library)
+            } else if let video = job.videoURL {
+                jobs.remove(job.id)
+                summarizeArchivedVideo(video, source: job.source, settings: settings, jobs: jobs, library: library)
+            } else if let original = job.originalFileURL {
+                jobs.remove(job.id)
+                analyzeLocalFile(original, settings: settings, jobs: jobs, library: library)
+            } else {
+                throw MVSError.processFailed("The original source is unavailable. Import the media again.")
+            }
+        } catch {
+            fail(job.id, error: error, jobs: jobs)
+        }
     }
 
     private func fail(_ id: AnalysisJob.ID, error: Error, jobs: JobStore) {
@@ -294,7 +359,7 @@ final class AnalysisPipeline {
             $0.stage = .failed
             $0.progressValue = 1.0
             $0.progress = "Failed"
-            $0.errorMessage = error.localizedDescription
+            $0.errorMessage = DiagnosticRedactor.redact(error.localizedDescription)
             $0.canRetry = true
         }
     }

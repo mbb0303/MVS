@@ -10,31 +10,40 @@ final class ObsidianWriter {
         prepared: PreparedMedia,
         transcript: TranscriptResult,
         summary: SummaryResult,
-        settings: SettingsStore,
+        settings: any NoteWritingSettings,
         transcriptModel: String,
         sourceURL: String? = nil,
         includeLocalVideo: Bool = true
     ) throws -> NoteWriteResult {
-        let sourceDirectory = settings.vaultURL.appendingPathComponent(source.libraryDirectoryName)
+        let existingLibrary = LibraryStore()
+        existingLibrary.refresh(settings: settings)
+        let existing = existingLibrary.finishedJobs.first { item in
+            guard item.source.libraryDirectoryName == source.libraryDirectoryName else { return false }
+            if item.mediaID == prepared.mediaID { return true }
+            guard source == .url, let sourceURL, !sourceURL.isEmpty,
+                  let handle = try? FileHandle(forReadingFrom: item.noteURL) else { return false }
+            defer { try? handle.close() }
+            let header = (try? handle.read(upToCount: 64 * 1024)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+            return NoteFrontMatter(header).value("source_url") == sourceURL
+        }
+        let title = existing?.title ?? title
+        let sourceDirectory = existing?.noteURL.deletingLastPathComponent()
+            ?? settings.vaultURL.appendingPathComponent(source.libraryDirectoryName)
+        guard MVSPaths.isURL(sourceDirectory, inside: settings.vaultURL) else {
+            throw MVSError.processFailed("Note directory is outside the MVS library.")
+        }
         try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
 
         let mediaID = prepared.mediaID
-        let noteName = "\(MVSPaths.sanitizeFilename(mediaID)).md"
+        let noteName = existing?.noteURL.lastPathComponent ?? "\(MVSPaths.artifactStem(mediaID)).md"
         let noteURL = sourceDirectory.appendingPathComponent(noteName)
-        let artifactBaseURL = sourceDirectory.appendingPathComponent(MVSPaths.sanitizeFilename(mediaID))
+        let artifactBaseURL = noteURL.deletingPathExtension()
         let metadataURL = artifactBaseURL.appendingPathExtension("metadata.json")
         let transcriptSRTURL = artifactBaseURL.appendingPathExtension("transcript.srt")
         let transcriptMarkdownURL = artifactBaseURL.appendingPathExtension("transcript.md")
         let summaryJSONURL = artifactBaseURL.appendingPathExtension("summary.json")
         let outlineURL = artifactBaseURL.appendingPathExtension("outline.md")
         let mindmapURL = artifactBaseURL.appendingPathExtension("mindmap.md")
-
-        try writeJSON(prepared.metadata, to: metadataURL)
-        try renderSRT(transcript).write(to: transcriptSRTURL, atomically: true, encoding: .utf8)
-        try renderTranscriptMarkdown(transcript).write(to: transcriptMarkdownURL, atomically: true, encoding: .utf8)
-        try writeJSON(summary, to: summaryJSONURL)
-        try renderOutline(summary: summary, title: title).write(to: outlineURL, atomically: true, encoding: .utf8)
-        try renderMindmap(summary: summary, title: title).write(to: mindmapURL, atomically: true, encoding: .utf8)
 
         let relativeVideo = includeLocalVideo
             ? prepared.archivedVideoURL.map { MVSPaths.relativePath(from: noteURL, to: $0) }
@@ -57,7 +66,18 @@ final class ObsidianWriter {
             settings: settings,
             transcriptModel: transcriptModel
         )
-        try markdown.write(to: noteURL, atomically: true, encoding: .utf8)
+        var metadata = prepared.metadata
+        metadata.title = title
+        let files: [(URL, Data)] = [
+            (metadataURL, try jsonData(metadata)),
+            (transcriptSRTURL, Data(renderSRT(transcript).utf8)),
+            (transcriptMarkdownURL, Data(renderTranscriptMarkdown(transcript).utf8)),
+            (summaryJSONURL, try jsonData(summary)),
+            (outlineURL, Data(renderOutline(summary: summary, title: title).utf8)),
+            (mindmapURL, Data(renderMindmap(summary: summary, title: title).utf8)),
+            (noteURL, Data(markdown.utf8))
+        ]
+        try ArtifactTransaction.write(files, directory: sourceDirectory)
         var artifacts = [
             JobArtifact(kind: .note, path: noteURL.path),
             JobArtifact(kind: .metadata, path: metadataURL.path),
@@ -67,7 +87,7 @@ final class ObsidianWriter {
             JobArtifact(kind: .outline, path: outlineURL.path),
             JobArtifact(kind: .mindmap, path: mindmapURL.path)
         ]
-        if let videoURL = prepared.archivedVideoURL {
+        if includeLocalVideo, let videoURL = prepared.archivedVideoURL {
             artifacts.append(JobArtifact(kind: .video, path: videoURL.path))
         }
         return NoteWriteResult(noteURL: noteURL, artifacts: artifacts)
@@ -88,7 +108,7 @@ final class ObsidianWriter {
         mindmapPath: String,
         transcript: TranscriptResult,
         summary: SummaryResult,
-        settings: SettingsStore,
+        settings: any NoteWritingSettings,
         transcriptModel: String
     ) -> String {
         let displayTitle = title.isEmpty ? source.fallbackTitle : title
@@ -97,30 +117,30 @@ final class ObsidianWriter {
         let timeline = summary.timeline.map { "- \($0)" }.joined(separator: "\n")
         let decisions = summary.keyDecisions.map { "- \($0)" }.joined(separator: "\n")
         let actions = summary.actionItems.map { "- \($0)" }.joined(separator: "\n")
-        let keywords = summary.keywords.map { "#\(MVSPaths.sanitizeFilename($0))" }.joined(separator: " ")
+        let keywords = summary.keywords.map { MVSPaths.keyword($0) }.filter { !$0.isEmpty }.map { "#\($0)" }.joined(separator: " ")
         let transcriptText = renderTranscript(transcript)
-        let escapedSourceURL = sourceURL?.replacingOccurrences(of: "\"", with: "\\\"") ?? ""
+        let escapedSourceURL = sourceURL ?? ""
         let sourceURLBlock = sourceURL.map { "\n## 原始链接\n\($0)\n" } ?? ""
         let videoPathValue = videoPath ?? ""
-        let videoBlock = videoPath.map { "\n![](\($0))\n" } ?? ""
+        let videoBlock = videoPath.map { "\n![](<\($0)>)\n" } ?? ""
 
         return """
         ---
         source: \(source.rawValue)
-        title: "\(displayTitle.replacingOccurrences(of: "\"", with: "\\\""))"
+        title: \(NoteFrontMatter.quote(displayTitle))
         created: \(created)
-        media_id: "\(mediaID.replacingOccurrences(of: "\"", with: "\\\""))"
-        source_url: "\(escapedSourceURL)"
+        media_id: \(NoteFrontMatter.quote(mediaID))
+        source_url: \(NoteFrontMatter.quote(escapedSourceURL))
         duration: \(durationLine)
-        video_path: "\(videoPathValue)"
-        metadata_path: "\(metadataPath)"
-        transcript_path: "\(transcriptPath)"
-        transcript_srt_path: "\(transcriptSRTPath)"
-        summary_json_path: "\(summaryJSONPath)"
-        outline_path: "\(outlinePath)"
-        mindmap_path: "\(mindmapPath)"
-        transcript_model: "\(transcriptModel)"
-        summary_model: "\(settings.summaryModel)"
+        video_path: \(NoteFrontMatter.quote(videoPathValue))
+        metadata_path: \(NoteFrontMatter.quote(metadataPath))
+        transcript_path: \(NoteFrontMatter.quote(transcriptPath))
+        transcript_srt_path: \(NoteFrontMatter.quote(transcriptSRTPath))
+        summary_json_path: \(NoteFrontMatter.quote(summaryJSONPath))
+        outline_path: \(NoteFrontMatter.quote(outlinePath))
+        mindmap_path: \(NoteFrontMatter.quote(mindmapPath))
+        transcript_model: \(NoteFrontMatter.quote(transcriptModel))
+        summary_model: \(NoteFrontMatter.quote(settings.summaryModel))
         ---
 
         # \(displayTitle)
@@ -146,12 +166,11 @@ final class ObsidianWriter {
         """
     }
 
-    private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
+    private func jsonData<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(value)
-        try data.write(to: url, options: .atomic)
+        return try encoder.encode(value)
     }
 
     private func renderTranscriptMarkdown(_ transcript: TranscriptResult) -> String {
@@ -214,19 +233,7 @@ final class ObsidianWriter {
     }
 
     private func renderTranscript(_ transcript: TranscriptResult) -> String {
-        guard !transcript.segments.isEmpty else {
-            return transcript.text
-        }
-        return transcript.segments.map { segment in
-            var prefix = ""
-            if let start = segment.start {
-                prefix += "[\(formatTime(start))]"
-            }
-            if let speaker = segment.speaker, !speaker.isEmpty {
-                prefix += prefix.isEmpty ? "\(speaker):" : " \(speaker):"
-            }
-            return prefix.isEmpty ? segment.text : "\(prefix) \(segment.text)"
-        }.joined(separator: "\n\n")
+        TranscriptText.render(transcript)
     }
 
     private func formatTime(_ seconds: Double) -> String {

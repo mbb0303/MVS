@@ -200,6 +200,8 @@ struct AnalysisJob: Identifiable, Codable {
     var mediaID: String?
     var artifacts: [JobArtifact]
     var canRetry: Bool
+    var urlOptions: URLAnalysisOptions?
+    var originalFileURL: URL?
 
     init(source: VideoSourceKind, title: String) {
         self.id = UUID()
